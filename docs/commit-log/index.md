@@ -17,3 +17,4 @@ notes add intent, context, and follow-ups that don't belong in a commit message.
 | 008 | [display-cap](008-display-decimation-save-buttons.md) | 2026-05-22 | Waveform display capped at 5000 pts (display-only); Free View split into Save display / Save full buttons |
 | 009 | [defaults](009-startup-default-config.md) | 2026-05-22 | New startup defaults: ±2.5 V DC on all channels, 1 MHz sampling, ±500 µs window |
 | 010 | [low-rates](010-low-sampling-rates.md) | 2026-05-22 | Add 400/200/100 kHz options to the time-base rate selector |
+| 011 | [readme](011-readme-and-push-rule.md) | 2026-05-22 | Add top-level README; convention to update it on every push |

@@ -35,4 +35,6 @@ matplotlib / Jupyter fluency — frame explanations in physics/instrumentation t
 - **Commit log:** every git commit gets a `docs/commit-log/NNN-slug.md` documenting what
   changed, why, verification (if any), and notes for future work — committed alongside
   the change, with `docs/commit-log/index.md` updated. See that folder for the format.
-- No README by request; documentation goes under `docs/`.
+- **README:** keep `README.md` current. **Every time you push, first update `README.md`**
+  to reflect the changes being pushed (features, controls, defaults, layout), and include
+  that update in the push. Additional documentation still goes under `docs/`.
