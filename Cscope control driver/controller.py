@@ -119,6 +119,13 @@ class MockScope:
             if i == 3:
                 # channel D: a TTL-ish square (trigger reference)
                 sig = np.where(np.sin(2 * np.pi * f * t) >= 0, hi * 0.8, lo * 0.1)
+            elif i == 2:
+                # channel C: a Lorentzian cavity resonance vs. the sweep axis,
+                # so the GUI's Lorentzian-fit mode has something to fit in --simulate.
+                t0 = self.start + 0.5 * duration         # centered in the window
+                fwhm = 0.08 * duration                   # ~8% of the span
+                hwhm = fwhm / 2.0
+                sig = amp * hwhm**2 / ((t - t0)**2 + hwhm**2)
             else:
                 phase = self._rng.uniform(0, 2 * np.pi)
                 sig = amp * np.sin(2 * np.pi * f * t + phase)

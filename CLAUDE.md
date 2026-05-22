@@ -10,9 +10,16 @@ measurements (Kasevich Group, Stanford).
   time axis, trigger, per-channel range/coupling, acquisition).
 - `Cscope control driver/controller.py` — `ScopeConfig` + `ScopeController` (+ `MockScope`
   for hardware-free simulation): a reusable, GUI-free control layer.
-- `Cscope control driver/gui.py` — a simplified PyQtGraph readout app on top.
+- `Cscope control driver/analysis.py` — pure numpy/scipy analysis routines (e.g.
+  `fit_lorentzian`), no Qt, so they import straight into a notebook.
+- `Cscope control driver/analysis_modes.py` — the GUI's mode framework:
+  `AnalysisMode` base + `FreeViewMode` and `LorentzianFitMode`. Add an analysis
+  mode by subclassing `AnalysisMode` and registering it in `ScopeWindow.modes`.
+- `Cscope control driver/gui.py` — a simplified PyQtGraph readout app on top, with a
+  Mode selector that swaps between free viewing and analysis modes.
 - `run_scope.py` — launcher (`--simulate` for no hardware).
-- Analysis lives in Jupyter notebooks; keep new code easy to import/use from one.
+- Analysis math lives in `analysis.py` (notebook-importable); keep new analysis code
+  easy to import/use from a notebook the same way.
 
 Note: the vendor driver loads its DLL via a relative path and the DLL is not in the
 repo, so hardware runs require it present; vendor modules use flat imports (the

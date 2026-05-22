@@ -14,8 +14,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from controller import (ScopeController, ScopeConfig, CH_NAMES, CH_COLORS,
-                        ACQ_MODES)
+from controller import ScopeController, CH_NAMES, CH_COLORS, ACQ_MODES
+from analysis_modes import FreeViewMode, LorentzianFitMode
 
 
 class AcquisitionWorker(QtCore.QThread):
@@ -81,26 +81,44 @@ class ScopeWindow(QtWidgets.QMainWindow):
     def __init__(self, simulate=False):
         super().__init__()
         self.setWindowTitle("Cleverscope Readout" + (" [SIMULATION]" if simulate else ""))
-        self.resize(1100, 650)
+        self.resize(1140, 720)
 
         self.controller = ScopeController(simulate=simulate)
         self.worker = None
+
+        # analysis modes (Free View + analysis suite); registered before the
+        # controls are built so their panels can populate the mode stack.
+        self.modes = [FreeViewMode(self), LorentzianFitMode(self)]
+        self.active_mode = self.modes[0]
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
 
-        layout.addWidget(self._build_controls(), 0)
-        layout.addWidget(self._build_plot(), 1)
+        plot = self._build_plot()           # sets self.plot / self.curves
+        # The control panel can grow taller than the window (more so as analysis
+        # modes are added), so put it in a scroll area: everything stays clickable
+        # and the panel just scrolls instead of squeezing widgets out of reach.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self._build_controls())
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setFixedWidth(352)            # 330 panel + room for the scrollbar
+        layout.addWidget(scroll, 0)
+        layout.addWidget(plot, 1)
 
-        self._set_running_state(False)
         self._sync_controls_to_config()
+        self._on_mode_changed(0)            # activate the initial mode
+        self._set_running_state(False)
 
     # ---------- UI construction ----------
     def _build_controls(self):
         panel = QtWidgets.QWidget()
-        panel.setFixedWidth(330)
+        panel.setMinimumWidth(320)
         v = QtWidgets.QVBoxLayout(panel)
+        v.setSpacing(6)
+        v.setContentsMargins(6, 6, 6, 6)
 
         # connection
         conn_box = QtWidgets.QGroupBox("Connection")
@@ -115,24 +133,15 @@ class ScopeWindow(QtWidgets.QMainWindow):
         cg.addWidget(self.status_lbl, 2, 0, 1, 2)
         v.addWidget(conn_box)
 
-        # run controls
-        run_box = QtWidgets.QGroupBox("Run")
-        rg = QtWidgets.QGridLayout(run_box)
+        # acquisition mode (shared across all view/analysis modes)
+        acq_box = QtWidgets.QGroupBox("Acquisition")
+        ag = QtWidgets.QGridLayout(acq_box)
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(ACQ_MODES)
         self.mode_combo.currentTextChanged.connect(self._on_config_changed)
-        self.run_btn = QtWidgets.QPushButton("Run")
-        self.run_btn.clicked.connect(self._start_continuous)
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.clicked.connect(self._stop_acquisition)
-        self.single_btn = QtWidgets.QPushButton("Single")
-        self.single_btn.clicked.connect(self._start_single)
-        rg.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
-        rg.addWidget(self.mode_combo, 0, 1, 1, 2)
-        rg.addWidget(self.run_btn, 1, 0)
-        rg.addWidget(self.stop_btn, 1, 1)
-        rg.addWidget(self.single_btn, 1, 2)
-        v.addWidget(run_box)
+        ag.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
+        ag.addWidget(self.mode_combo, 0, 1)
+        v.addWidget(acq_box)
 
         # trigger
         trig_box = QtWidgets.QGroupBox("Trigger")
@@ -161,7 +170,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         bg = QtWidgets.QGridLayout(tb_box)
         self.rate_combo = QtWidgets.QComboBox()
         self._rate_values = [400e6, 200e6, 100e6, 50e6, 20e6, 10e6, 1e6]
-        self.rate_combo.addItems([self._fmt_hz(r) for r in self._rate_values])
+        self.rate_combo.addItems([self.fmt_hz(r) for r in self._rate_values])
         self.rate_combo.currentIndexChanged.connect(self._on_config_changed)
         self.start_spin = QtWidgets.QDoubleSpinBox()
         self.start_spin.setRange(-1000.0, 1000.0)
@@ -218,24 +227,19 @@ class ScopeWindow(QtWidgets.QMainWindow):
             self.ch_coupling.append(cpl)
         v.addWidget(ch_box)
 
-        # display autoscale
-        disp_box = QtWidgets.QGroupBox("Display")
-        dg = QtWidgets.QHBoxLayout(disp_box)
-        self.autox_btn = QtWidgets.QPushButton("Auto X (full range)")
-        self.autox_btn.clicked.connect(self._autoscale_x)
-        self.autoy_btn = QtWidgets.QPushButton("Auto Y (measured)")
-        self.autoy_btn.clicked.connect(self._autoscale_y)
-        dg.addWidget(self.autox_btn)
-        dg.addWidget(self.autoy_btn)
-        v.addWidget(disp_box)
+        # mode selector + swappable per-mode panel (Free View / analysis modes)
+        mode_box = QtWidgets.QGroupBox("Mode")
+        mg = QtWidgets.QVBoxLayout(mode_box)
+        self.analysis_combo = QtWidgets.QComboBox()
+        self.analysis_combo.addItems([m.name for m in self.modes])
+        self.analysis_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.mode_stack = QtWidgets.QStackedWidget()
+        for m in self.modes:
+            self.mode_stack.addWidget(m.build_panel())
+        mg.addWidget(self.analysis_combo)
+        mg.addWidget(self.mode_stack)
+        v.addWidget(mode_box)
 
-        self.save_btn = QtWidgets.QPushButton("Save last frame (.npz)")
-        self.save_btn.clicked.connect(self._save_last)
-        v.addWidget(self.save_btn)
-
-        self.metrics_lbl = QtWidgets.QLabel("No data yet.")
-        self.metrics_lbl.setWordWrap(True)
-        v.addWidget(self.metrics_lbl)
         v.addStretch(1)
         return panel
 
@@ -309,7 +313,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
     # ---------- actions ----------
     def _toggle_connect(self):
         if self.controller.connected:
-            self._stop_acquisition()
+            self.stop_acquisition()
             self.controller.disconnect()
             self.status_lbl.setText("Disconnected")
             self.connect_btn.setText("Connect")
@@ -325,10 +329,19 @@ class ScopeWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Connect", "Failed to connect to the scope.")
         self._set_running_state(False)
 
-    def _start_continuous(self):
+    def _on_mode_changed(self, idx):
+        """Swap the active analysis mode: tear down the old one, set up the new."""
+        self.active_mode.deactivate()
+        self.mode_stack.setCurrentIndex(idx)
+        self.active_mode = self.modes[idx]
+        self.active_mode.activate()
+        self._set_running_state(self.worker is not None and self.worker.isRunning())
+
+    # mode panels call these public helpers
+    def start_continuous(self):
         self._start_worker(continuous=True)
 
-    def _start_single(self):
+    def start_single(self):
         self._start_worker(continuous=False)
 
     def _start_worker(self, continuous):
@@ -345,7 +358,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self._set_running_state(True, continuous=continuous)
         self.worker.start()
 
-    def _stop_acquisition(self):
+    def stop_acquisition(self):
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
@@ -358,16 +371,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
     def _on_frame(self, payload):
         t, channels, metrics = payload
-        for i in range(4):
-            if self.controller.config.enabled[i]:
-                self.curves[i].setData(t, channels[i])
-            else:
-                self.curves[i].setData([], [])
-        self.metrics_lbl.setText(
-            f"N = {metrics['n']:,}   fs = {self._fmt_hz(metrics['fs'])}\n"
-            f"dt = {metrics['dt']*1e9:.2f} ns   span = {metrics['duration']*1e3:.3f} ms")
+        self.active_mode.on_frame(t, channels, metrics)
 
-    def _save_last(self):
+    def save_last(self):
         cap = self.controller.last_capture
         if cap is None:
             QtWidgets.QMessageBox.information(self, "Save", "No capture to save yet.")
@@ -380,7 +386,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         np.savez(path, t=t, A=channels[0], B=channels[1], C=channels[2], D=channels[3])
         self.status_lbl.setText(f"Saved {path}")
 
-    def _autoscale_x(self):
+    def autoscale_x(self):
         """Fit the x-axis to the full time span of the last frame."""
         cap = self.controller.last_capture
         if cap is None or len(cap[0]) == 0:
@@ -388,7 +394,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         t = cap[0]
         self.plot.setXRange(float(t[0]), float(t[-1]), padding=0)
 
-    def _autoscale_y(self):
+    def autoscale_y(self):
         """Fit the y-axis to the measured min/max across enabled channels."""
         cap = self.controller.last_capture
         if cap is None:
@@ -406,14 +412,11 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.plot.setYRange(ymin, ymax, padding=0.05)
 
     def _set_running_state(self, running, continuous=False):
-        connected = self.controller.connected
-        self.run_btn.setEnabled(connected and not running)
-        self.single_btn.setEnabled(connected and not running)
-        self.stop_btn.setEnabled(running and continuous)
         self.connect_btn.setEnabled(not running)
+        self.active_mode.set_running_state(running, continuous)
 
     @staticmethod
-    def _fmt_hz(hz):
+    def fmt_hz(hz):
         if not np.isfinite(hz):
             return "-"
         for div, unit in [(1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")]:
@@ -422,7 +425,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         return f"{hz:g} Hz"
 
     def closeEvent(self, event):
-        self._stop_acquisition()
+        self.stop_acquisition()
         if self.controller.connected:
             self.controller.disconnect()
         super().closeEvent(event)
