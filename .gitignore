@@ -38,3 +38,9 @@ desktop.ini
 
 # Claude Code config (local settings only)
 .claude/settings.local.json
+
+*.dll
+*.h
+*.lib
+*.ini
+*.aliases

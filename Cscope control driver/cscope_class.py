@@ -18,6 +18,7 @@ import numpy as np
 class CScope:
     def __init__(self):
         self.scope = None
+        self.is_connected = False
         self.MaxChannels = 4
         self.ch_names = ["A", "B", "C", "D"]
         self.ch_colors = ["red", "blue", "green", "orange"]
@@ -106,20 +107,25 @@ class CScope:
             print("No active connection object found to disconnect.")
             return
         else:
-            print("Sending Close commands to hardware...")
+            print("Sending Close command to hardware...")
             try:
-                # 2. Send Driver Commands
-                # T_Command_Close: Closes the specific unit connection
+                # T_Command_Close releases the hardware/USB handle for this unit.
+                # Do NOT also send T_Command_Finish: it tears down the whole LabVIEW
+                # driver runtime and blocks indefinitely (forcing a kernel restart),
+                # and leaves the runtime closed so you can't reconnect in the same
+                # session. The vendor example shuts down with Close alone.
                 self.scope.SendCleverscopeCommand(T_Command.T_Command_Close)
-
-                # T_Command_Finish: Closes the driver library entirely
-                self.scope.SendCleverscopeCommand(T_Command.T_Command_Finish)
                 print("Hardware handle closed.")
 
             except Exception as e:
-                print(f"Warning: Error sending close commands (Unit might be gone already): {e}")
+                print(f"Warning: Error sending close command (Unit might be gone already): {e}")
+        self.scope = None
+        self.is_connected = False
         print(f"{'_'*40}\n")
 
+
+    def IsConnected(self):
+        return self.scope is not None and self.scope.IsConnected()
 
     def __del__(self):
         """

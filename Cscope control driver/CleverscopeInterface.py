@@ -5,6 +5,7 @@ Updated August 2021 RHC
 '''
 
 import ctypes
+import os
 from T_AcquireSpec import T_AcquireSpec, T_AcquireAction, T_SigGenWaveform, T_LinkPort, T_TrigChannel
 from T_ChannelSpec import T_ChannelSpec, T_Probe, T_GlobalFilter, T_PreFilter20MHz, T_MA_Filter, T_ExpFilter, T_FilterOption, T_Coupling
 from T_InterfaceSpec import T_InterfaceSpec, T_Interface
@@ -94,7 +95,8 @@ class Cleverscope:
 		### DLL PROTOTYPES ###
 		######################
 
-		self.CscopeDLL = ctypes.WinDLL("Cscope control driver\\Cscope control driver 64.dll")
+		_dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Cscope control driver 64.dll")
+		self.CscopeDLL = ctypes.WinDLL(_dll_path)
 
 		###### NOTES:
 		# For the self.xxxxxxParams below, the values such as = (1,"p1",0) or (A, B, C) have the following meanings:

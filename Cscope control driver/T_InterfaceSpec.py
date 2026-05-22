@@ -9,7 +9,7 @@ import ipaddress
 
 
 def convertSerialNumberToUINT32(SerialNumberPart):  
-    sNuint8=(np.fromstring(SerialNumberPart[::-1], dtype=np.uint8)) #reverse it and convert it to uint8
+    sNuint8=(np.frombuffer(SerialNumberPart[::-1].encode('latin-1'), dtype=np.uint8)) #reverse it and convert it to uint8
     return int(np.frombuffer(sNuint8, dtype=np.uint32))
     
 class T_Interface:
