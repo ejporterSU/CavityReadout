@@ -11,7 +11,7 @@ Modes operate on a host window (`ScopeWindow`) passed in at construction; they
 never `import gui`, so there's no circular import. From the host they use:
 `controller`, `plot`, `curves`, the acquisition helpers
 (`start_continuous`/`start_single`/`stop_acquisition`), `autoscale_x/y`,
-`save_last`, and `fmt_hz`.
+`save_display`/`save_full`, `decimate_display`, and `fmt_hz`.
 """
 
 import numpy as np
@@ -19,7 +19,7 @@ import pyqtgraph as pg
 from PySide6 import QtWidgets
 
 from controller import CH_NAMES
-from analysis import fit_lorentzian
+from analysis import fit_lorentzian, compute_spectrum
 
 
 def _fmt_s(seconds):
@@ -92,9 +92,18 @@ class FreeViewMode(AnalysisMode):
         dg.addWidget(autoy_btn)
         v.addWidget(disp_box)
 
-        self.save_btn = QtWidgets.QPushButton("Save last frame (.npz)")
-        self.save_btn.clicked.connect(self.host.save_last)
-        v.addWidget(self.save_btn)
+        save_box = QtWidgets.QGroupBox("Save (.npz)")
+        sg = QtWidgets.QHBoxLayout(save_box)
+        self.save_disp_btn = QtWidgets.QPushButton("Save display")
+        self.save_disp_btn.setToolTip("Save the decimated trace as displayed "
+                                      "(≤ 5000 points/channel).")
+        self.save_disp_btn.clicked.connect(self.host.save_display)
+        self.save_full_btn = QtWidgets.QPushButton("Save full")
+        self.save_full_btn.setToolTip("Save the full-resolution capture.")
+        self.save_full_btn.clicked.connect(self.host.save_full)
+        sg.addWidget(self.save_disp_btn)
+        sg.addWidget(self.save_full_btn)
+        v.addWidget(save_box)
 
         self.metrics_lbl = QtWidgets.QLabel("No data yet.")
         self.metrics_lbl.setWordWrap(True)
@@ -111,7 +120,8 @@ class FreeViewMode(AnalysisMode):
     def _draw(self, t, channels):
         for i in range(4):
             if self.host.controller.config.enabled[i]:
-                self.host.curves[i].setData(t, channels[i])
+                td, yd = self.host.decimate_display(t, channels[i])
+                self.host.curves[i].setData(td, yd)
             else:
                 self.host.curves[i].setData([], [])
 
@@ -205,10 +215,12 @@ class LorentzianFitMode(AnalysisMode):
         # show only the channel being analyzed
         for i in range(4):
             if i == sel:
-                self.host.curves[i].setData(t, channels[i])
+                td, yd = self.host.decimate_display(t, channels[i])
+                self.host.curves[i].setData(td, yd)
             else:
                 self.host.curves[i].setData([], [])
 
+        # fit on the full-resolution channel, regardless of display decimation
         res = fit_lorentzian(t, channels[sel])
         name = CH_NAMES[sel]
         if not res["success"]:
@@ -231,3 +243,216 @@ class LorentzianFitMode(AnalysisMode):
     def set_running_state(self, running, continuous):
         connected = self.host.controller.connected
         self.fit_btn.setEnabled(connected and not running)
+
+
+class FFTMode(AnalysisMode):
+    """Live single-channel spectrum analyzer drawn on the host's FFT plot.
+
+    Shows the one-sided spectrum of one selected channel (amplitude V or ASD
+    V/√Hz, linear or dB) computed with a selectable window. The time-domain plot
+    above keeps showing the same channel; the FFT plot occupies the bottom pane
+    only while this mode is active."""
+
+    name = "FFT View"
+
+    _WINDOWS = ["Hann", "Hamming", "Blackman", "Rectangular"]
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.fft_curve = pg.PlotDataItem(pen=pg.mkPen("b", width=1))
+        self._on_plot = False
+        self._last_f = None        # cached freq axis for "Full (Nyquist)"
+
+    def build_panel(self):
+        panel = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        run_box = QtWidgets.QGroupBox("Run")
+        rg = QtWidgets.QGridLayout(run_box)
+        self.run_btn = QtWidgets.QPushButton("Run")
+        self.run_btn.clicked.connect(self.host.start_continuous)
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.host.stop_acquisition)
+        self.single_btn = QtWidgets.QPushButton("Single")
+        self.single_btn.clicked.connect(self.host.start_single)
+        rg.addWidget(self.run_btn, 0, 0)
+        rg.addWidget(self.stop_btn, 0, 1)
+        rg.addWidget(self.single_btn, 0, 2)
+        v.addWidget(run_box)
+
+        box = QtWidgets.QGroupBox("Spectrum")
+        g = QtWidgets.QGridLayout(box)
+        g.addWidget(QtWidgets.QLabel("Channel"), 0, 0)
+        self.ch_combo = QtWidgets.QComboBox()
+        self.ch_combo.addItems(CH_NAMES)
+        self.ch_combo.currentIndexChanged.connect(self._rerender)
+        g.addWidget(self.ch_combo, 0, 1)
+
+        g.addWidget(QtWidgets.QLabel("Quantity"), 1, 0)
+        self.qty_combo = QtWidgets.QComboBox()
+        self.qty_combo.addItems(["Amplitude (V)", "ASD (V/√Hz)"])
+        self.qty_combo.currentIndexChanged.connect(self._rerender)
+        g.addWidget(self.qty_combo, 1, 1)
+
+        g.addWidget(QtWidgets.QLabel("Scale"), 2, 0)
+        self.scale_combo = QtWidgets.QComboBox()
+        self.scale_combo.addItems(["Linear", "dB"])
+        self.scale_combo.currentIndexChanged.connect(self._rerender)
+        g.addWidget(self.scale_combo, 2, 1)
+
+        g.addWidget(QtWidgets.QLabel("Window"), 3, 0)
+        self.window_combo = QtWidgets.QComboBox()
+        self.window_combo.addItems(self._WINDOWS)
+        self.window_combo.currentIndexChanged.connect(self._rerender)
+        g.addWidget(self.window_combo, 3, 1)
+        v.addWidget(box)
+
+        range_box = QtWidgets.QGroupBox("Frequency range")
+        rgb = QtWidgets.QGridLayout(range_box)
+        self.fmin_spin = QtWidgets.QDoubleSpinBox()
+        self.fmin_spin.setRange(0.0, 5000.0); self.fmin_spin.setDecimals(6)
+        self.fmin_spin.setSuffix(" MHz")
+        self.fmin_spin.valueChanged.connect(self._apply_freq_range)
+        self.fmax_spin = QtWidgets.QDoubleSpinBox()
+        self.fmax_spin.setRange(0.0, 5000.0); self.fmax_spin.setDecimals(6)
+        self.fmax_spin.setSuffix(" MHz")
+        self.fmax_spin.valueChanged.connect(self._apply_freq_range)
+        self.full_btn = QtWidgets.QPushButton("Full (Nyquist)")
+        self.full_btn.clicked.connect(self._full_range)
+        self.autoy_btn = QtWidgets.QPushButton("Auto Y")
+        self.autoy_btn.clicked.connect(self._fft_autoscale_y)
+        rgb.addWidget(QtWidgets.QLabel("Min"), 0, 0)
+        rgb.addWidget(self.fmin_spin, 0, 1)
+        rgb.addWidget(QtWidgets.QLabel("Max"), 1, 0)
+        rgb.addWidget(self.fmax_spin, 1, 1)
+        rgb.addWidget(self.full_btn, 2, 0)
+        rgb.addWidget(self.autoy_btn, 2, 1)
+        v.addWidget(range_box)
+
+        self.readout_lbl = QtWidgets.QLabel("No data yet. Connect, then Run.")
+        self.readout_lbl.setWordWrap(True)
+        v.addWidget(self.readout_lbl)
+        return panel
+
+    # ---- control state helpers ----
+    def _selected(self):
+        return self.ch_combo.currentIndex()
+
+    def _scaling(self):
+        return "asd" if self.qty_combo.currentIndex() == 1 else "amplitude"
+
+    def _window(self):
+        return self.window_combo.currentText().lower()
+
+    def _rerender(self, *args):
+        cap = self.host.controller.last_capture
+        if cap is not None:
+            t, channels = cap
+            self.on_frame(t, channels, None)
+
+    # ---- activation ----
+    def activate(self):
+        for i in range(4):
+            if self.host.controller.config.enabled[i]:
+                self.ch_combo.setCurrentIndex(i)
+                break
+        self.host.show_fft_panel(True)
+        if not self._on_plot:
+            self.host.fft_plot.addItem(self.fft_curve)
+            self._on_plot = True
+        cap = self.host.controller.last_capture
+        if cap is not None:
+            t, channels = cap
+            self.on_frame(t, channels, None)
+        else:
+            self._show_only_selected_blank()
+
+    def deactivate(self):
+        if self._on_plot:
+            self.host.fft_plot.removeItem(self.fft_curve)
+            self._on_plot = False
+        self.fft_curve.setData([], [])
+        self.host.show_fft_panel(False)
+
+    def _show_only_selected_blank(self):
+        sel = self._selected()
+        for i in range(4):
+            if i != sel:
+                self.host.curves[i].setData([], [])
+
+    # ---- frame handling / drawing ----
+    def on_frame(self, t, channels, metrics):
+        sel = self._selected()
+        for i in range(4):
+            if i == sel:
+                td, yd = self.host.decimate_display(t, channels[i])
+                self.host.curves[i].setData(td, yd)
+            else:
+                self.host.curves[i].setData([], [])
+
+        res = compute_spectrum(t, channels[sel], window=self._window(),
+                               scaling=self._scaling())
+        name = CH_NAMES[sel]
+        if not res["success"]:
+            self.fft_curve.setData([], [])
+            self.readout_lbl.setText(f"Ch {name}: {res['message']}")
+            return
+
+        f, mag, units = res["f"], res["mag"], res["units"]
+        self._last_f = f
+        if self.scale_combo.currentText() == "dB":
+            ref = float(np.max(mag)) if mag.size else 0.0
+            floor = ref * 1e-12 if ref > 0 else 1e-12
+            ydata = 20.0 * np.log10(np.maximum(mag, floor))
+            ylabel = "dBV" if units == "V" else f"dB({units})"
+        else:
+            ydata = mag
+            ylabel = units
+        self.fft_curve.setData(f, ydata)
+        self.host.fft_plot.setLabel("left", ylabel)
+
+        self.readout_lbl.setText(
+            f"Ch {name} spectrum\n"
+            f"fs = {self.host.fmt_hz(res['fs'])}   Nyquist = {self.host.fmt_hz(res['nyquist'])}\n"
+            f"df = {self.host.fmt_hz(res['df'])}   ENBW = {self.host.fmt_hz(res['enbw'])}\n"
+            f"window = {self.window_combo.currentText()}")
+
+    # ---- frequency range / autoscale ----
+    def _apply_freq_range(self, *args):
+        lo = self.fmin_spin.value() * 1e6
+        hi = self.fmax_spin.value() * 1e6
+        if hi > lo:
+            self.host.fft_plot.setXRange(lo, hi, padding=0)
+
+    def _full_range(self):
+        if self._last_f is None or self._last_f.size == 0:
+            return
+        fmax = float(self._last_f[-1])
+        self.host.fft_plot.setXRange(0.0, fmax, padding=0)
+        self._loading = True
+        self.fmin_spin.setValue(0.0)
+        self.fmax_spin.setValue(fmax / 1e6)
+        self._loading = False
+
+    def _fft_autoscale_y(self):
+        """Fit the FFT y-axis to the data within the visible frequency range."""
+        data = self.fft_curve.getData()
+        if data is None or data[0] is None or len(data[0]) == 0:
+            return
+        f, y = np.asarray(data[0]), np.asarray(data[1])
+        (lo, hi), _ = self.host.fft_plot.viewRange()
+        mask = (f >= lo) & (f <= hi)
+        if not np.any(mask):
+            mask = np.ones(f.size, dtype=bool)
+        ymin, ymax = float(np.min(y[mask])), float(np.max(y[mask]))
+        if ymin == ymax:
+            pad = abs(ymin) * 0.1 or 0.5
+            ymin, ymax = ymin - pad, ymax + pad
+        self.host.fft_plot.setYRange(ymin, ymax, padding=0.05)
+
+    def set_running_state(self, running, continuous):
+        connected = self.host.controller.connected
+        self.run_btn.setEnabled(connected and not running)
+        self.single_btn.setEnabled(connected and not running)
+        self.stop_btn.setEnabled(running and continuous)

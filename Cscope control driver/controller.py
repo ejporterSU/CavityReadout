@@ -25,11 +25,11 @@ ACQ_MODES = ["Auto", "Triggered", "Single"]
 class ScopeConfig:
     """Everything the GUI can edit. Plain values, no ctypes / vendor enums."""
     serial_number: str = "EQ10014"
-    sampling_rate_hz: float = 100e6
+    sampling_rate_hz: float = 1e6
     start_time_s: float = -0.5e-3
-    stop_time_s: float = 6.5e-3
-    ranges: list = field(default_factory=lambda: [(-0.5, 0.5), (-0.2, 0.2), (-1.0, 1.0), (-5.0, 5.0)])
-    couplings: list = field(default_factory=lambda: ["AC", "AC", "AC", "DC"])
+    stop_time_s: float = 0.5e-3
+    ranges: list = field(default_factory=lambda: [(-2.5, 2.5), (-2.5, 2.5), (-2.5, 2.5), (-2.5, 2.5)])
+    couplings: list = field(default_factory=lambda: ["DC", "DC", "DC", "DC"])
     enabled: list = field(default_factory=lambda: [True, True, True, True])
     trigger_channel: str = "D"
     trigger_level_v: float = 1.0
@@ -65,9 +65,9 @@ class MockScope:
 
     def __init__(self):
         self.start = -0.5e-3
-        self.stop = 6.5e-3
-        self.rate = 100e6
-        self.ranges = [(-0.5, 0.5), (-0.2, 0.2), (-1.0, 1.0), (-5.0, 5.0)]
+        self.stop = 0.5e-3
+        self.rate = 1e6
+        self.ranges = [(-2.5, 2.5), (-2.5, 2.5), (-2.5, 2.5), (-2.5, 2.5)]
         self.trig_ch = "D"
         self.trig_level = 1.0
         self.trig_slope = "Rising"

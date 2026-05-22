@@ -15,7 +15,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from controller import ScopeController, CH_NAMES, CH_COLORS, ACQ_MODES
-from analysis_modes import FreeViewMode, LorentzianFitMode
+from analysis_modes import FreeViewMode, LorentzianFitMode, FFTMode
 
 
 class AcquisitionWorker(QtCore.QThread):
@@ -78,6 +78,11 @@ class HoverAxis(pg.AxisItem):
 
 
 class ScopeWindow(QtWidgets.QMainWindow):
+    # Cap the points actually drawn for a waveform trace; the underlying capture
+    # stays full-resolution (analysis and "Save full" use it). Purely a display
+    # speed-up — fewer points to render per frame.
+    MAX_DISPLAY_POINTS = 5000
+
     def __init__(self, simulate=False):
         super().__init__()
         self.setWindowTitle("Cleverscope Readout" + (" [SIMULATION]" if simulate else ""))
@@ -85,10 +90,11 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
         self.controller = ScopeController(simulate=simulate)
         self.worker = None
+        self._continuous = False     # is the active run a continuous one?
 
         # analysis modes (Free View + analysis suite); registered before the
         # controls are built so their panels can populate the mode stack.
-        self.modes = [FreeViewMode(self), LorentzianFitMode(self)]
+        self.modes = [FreeViewMode(self), LorentzianFitMode(self), FFTMode(self)]
         self.active_mode = self.modes[0]
 
         central = QtWidgets.QWidget()
@@ -169,7 +175,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         tb_box = QtWidgets.QGroupBox("Time base")
         bg = QtWidgets.QGridLayout(tb_box)
         self.rate_combo = QtWidgets.QComboBox()
-        self._rate_values = [400e6, 200e6, 100e6, 50e6, 20e6, 10e6, 1e6]
+        self._rate_values = [400e6, 200e6, 100e6, 50e6, 20e6, 10e6, 1e6,
+                             400e3, 200e3, 100e3]
         self.rate_combo.addItems([self.fmt_hz(r) for r in self._rate_values])
         self.rate_combo.currentIndexChanged.connect(self._on_config_changed)
         self.start_spin = QtWidgets.QDoubleSpinBox()
@@ -258,7 +265,20 @@ class ScopeWindow(QtWidgets.QMainWindow):
             curve.setDownsampling(auto=True)
             curve.setClipToView(True)
             self.curves.append(curve)
-        return self.plot
+
+        # FFT plot lives in the bottom pane, hidden until FFT View mode reveals it.
+        self.fft_plot = pg.PlotWidget(axisItems={"bottom": HoverAxis("bottom"),
+                                                 "left": HoverAxis("left")})
+        self.fft_plot.setBackground("w")
+        self.fft_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.fft_plot.setLabel("bottom", "Frequency", units="Hz")
+        self.fft_plot.setLabel("left", "Magnitude")
+        self.fft_plot.hide()
+
+        self.plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.plot_splitter.addWidget(self.plot)
+        self.plot_splitter.addWidget(self.fft_plot)
+        return self.plot_splitter
 
     # ---------- config <-> widgets ----------
     def _sync_controls_to_config(self):
@@ -351,11 +371,12 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
         self._read_config_from_controls()
+        self._continuous = continuous
         self.worker = AcquisitionWorker(self.controller, continuous=continuous)
         self.worker.frameReady.connect(self._on_frame)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self._on_worker_done)
-        self._set_running_state(True, continuous=continuous)
+        self._set_running_state(True)
         self.worker.start()
 
     def stop_acquisition(self):
@@ -373,18 +394,44 @@ class ScopeWindow(QtWidgets.QMainWindow):
         t, channels, metrics = payload
         self.active_mode.on_frame(t, channels, metrics)
 
-    def save_last(self):
+    def decimate_display(self, t, y):
+        """Stride-decimate one trace to <= MAX_DISPLAY_POINTS for fast drawing.
+
+        Display-only: returns a view of every step-th sample (step chosen so the
+        result never exceeds the cap). Short traces pass through unchanged."""
+        n = len(t)
+        if n <= self.MAX_DISPLAY_POINTS:
+            return t, y
+        step = int(np.ceil(n / self.MAX_DISPLAY_POINTS))
+        return t[::step], y[::step]
+
+    def save_full(self):
+        """Save the full-resolution last capture."""
+        self._save_capture(decimated=False)
+
+    def save_display(self):
+        """Save the decimated trace as displayed (<= MAX_DISPLAY_POINTS points)."""
+        self._save_capture(decimated=True)
+
+    def _save_capture(self, decimated):
         cap = self.controller.last_capture
         if cap is None:
             QtWidgets.QMessageBox.information(self, "Save", "No capture to save yet.")
             return
+        t, channels = cap
+        if decimated:
+            # one shared stride (all channels share t), reusing the draw-path helper
+            t = self.decimate_display(t, t)[0]
+            channels = [self.decimate_display(cap[0], c)[1] for c in channels]
+            default, label = "capture_display.npz", "display waveform"
+        else:
+            default, label = "capture_full.npz", "full waveform"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save last frame", "capture.npz", "NumPy archive (*.npz)")
+            self, f"Save {label}", default, "NumPy archive (*.npz)")
         if not path:
             return
-        t, channels = cap
         np.savez(path, t=t, A=channels[0], B=channels[1], C=channels[2], D=channels[3])
-        self.status_lbl.setText(f"Saved {path}")
+        self.status_lbl.setText(f"Saved {label}: {path}")
 
     def autoscale_x(self):
         """Fit the x-axis to the full time span of the last frame."""
@@ -411,9 +458,21 @@ class ScopeWindow(QtWidgets.QMainWindow):
             ymin, ymax = ymin - pad, ymax + pad
         self.plot.setYRange(ymin, ymax, padding=0.05)
 
-    def _set_running_state(self, running, continuous=False):
+    def show_fft_panel(self, visible):
+        """Reveal/hide the bottom FFT pane (waveform ~2/3, FFT ~1/3 when shown)."""
+        self.fft_plot.setVisible(visible)
+        if visible:
+            h = self.plot_splitter.height() or self.height()
+            self.plot_splitter.setSizes([int(h * 2 / 3), int(h / 3)])
+
+    def _set_running_state(self, running):
+        # `continuous` is tracked on the window (set when a run starts) so it stays
+        # correct across mode switches and worker callbacks — otherwise switching
+        # modes mid-run would drop the flag and gray out Stop with no way back.
+        if not running:
+            self._continuous = False
         self.connect_btn.setEnabled(not running)
-        self.active_mode.set_running_state(running, continuous)
+        self.active_mode.set_running_state(running, self._continuous)
 
     @staticmethod
     def fmt_hz(hz):

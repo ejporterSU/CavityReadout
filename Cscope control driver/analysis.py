@@ -100,3 +100,87 @@ def fit_lorentzian(t, y):
         "y_fit": lorentzian(t_fit, *popt),
         "message": "Fit converged.",
     }
+
+
+_WINDOWS = {
+    "rectangular": np.ones,
+    "hann": np.hanning,
+    "hamming": np.hamming,
+    "blackman": np.blackman,
+}
+
+
+def compute_spectrum(t, y, window="hann", scaling="amplitude"):
+    """One-sided amplitude/PSD spectrum of a uniformly-sampled real signal y(t).
+
+    window  : "rectangular" | "hann" | "hamming" | "blackman" — the taper applied
+              before the FFT to control spectral leakage.
+    scaling : "amplitude" -> peak amplitude per frequency bin, units V (a sinusoid
+                             of amplitude A reads A at its line, window-independent);
+              "asd"        -> amplitude spectral density, units V/√Hz (flat for white
+                             noise, the natural quantity for noise-floor work).
+
+    Returns a dict (mirrors fit_lorentzian's style):
+        success : bool
+        f       : np.ndarray   one-sided frequency axis (Hz)
+        mag     : np.ndarray   spectrum in the requested units
+        units   : str          "V" or "V/√Hz"
+        fs      : float        sampling rate (Hz)
+        df      : float        bin spacing fs/N (Hz)
+        enbw    : float        equivalent noise bandwidth of the window (Hz)
+        nyquist : float        fs/2 (Hz)
+        message : str
+    """
+    fail = lambda msg: {"success": False, "f": np.array([]), "mag": np.array([]),
+                        "units": "", "fs": float("nan"), "df": float("nan"),
+                        "enbw": float("nan"), "nyquist": float("nan"),
+                        "message": msg}
+
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if n < 4 or t.size != n:
+        return fail("Not enough samples for an FFT.")
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(y))):
+        return fail("Data contains non-finite values.")
+
+    span = float(t[-1] - t[0])
+    if span <= 0:
+        return fail("Time axis is not increasing.")
+    fs = (n - 1) / span
+
+    win_fn = _WINDOWS.get(window, np.hanning)
+    w = win_fn(n)
+    s1 = float(w.sum())
+    s2 = float((w * w).sum())
+    if s1 == 0:
+        return fail("Degenerate window.")
+
+    Y = np.fft.rfft(y * w)
+    f = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    # one-sided correction: double every bin except DC and (for even n) Nyquist.
+    two = np.full(Y.size, 2.0)
+    two[0] = 1.0
+    if n % 2 == 0:
+        two[-1] = 1.0
+
+    if scaling == "asd":
+        psd = two * np.abs(Y) ** 2 / (fs * s2)   # V²/Hz, one-sided
+        mag = np.sqrt(psd)
+        units = "V/√Hz"
+    else:
+        mag = two * np.abs(Y) / s1               # peak amplitude per bin, V
+        units = "V"
+
+    return {
+        "success": True,
+        "f": f,
+        "mag": mag,
+        "units": units,
+        "fs": fs,
+        "df": fs / n,
+        "enbw": fs * s2 / (s1 * s1),
+        "nyquist": fs / 2.0,
+        "message": "OK.",
+    }

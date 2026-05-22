@@ -11,9 +11,10 @@ measurements (Kasevich Group, Stanford).
 - `Cscope control driver/controller.py` — `ScopeConfig` + `ScopeController` (+ `MockScope`
   for hardware-free simulation): a reusable, GUI-free control layer.
 - `Cscope control driver/analysis.py` — pure numpy/scipy analysis routines (e.g.
-  `fit_lorentzian`), no Qt, so they import straight into a notebook.
+  `fit_lorentzian`, `compute_spectrum`), no Qt, so they import straight into a notebook.
 - `Cscope control driver/analysis_modes.py` — the GUI's mode framework:
-  `AnalysisMode` base + `FreeViewMode` and `LorentzianFitMode`. Add an analysis
+  `AnalysisMode` base + `FreeViewMode`, `LorentzianFitMode`, and `FFTMode` (live
+  single-channel spectrum, amplitude/ASD, linear/dB, windowed). Add an analysis
   mode by subclassing `AnalysisMode` and registering it in `ScopeWindow.modes`.
 - `Cscope control driver/gui.py` — a simplified PyQtGraph readout app on top, with a
   Mode selector that swaps between free viewing and analysis modes.
