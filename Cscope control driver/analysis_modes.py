@@ -147,7 +147,9 @@ class LorentzianFitMode(AnalysisMode):
         super().__init__(host)
         self.fit_curve = pg.PlotDataItem(pen=pg.mkPen("k", width=2,
                                                       style=pg.QtCore.Qt.DashLine))
-        self._on_plot = False
+        # Track which ViewBox currently owns the fit overlay so we can remove it
+        # cleanly and move it when the selected channel switches sides (A/B ↔ C/D).
+        self._fit_vb = None
 
     def build_panel(self):
         panel = QtWidgets.QWidget()
@@ -176,11 +178,22 @@ class LorentzianFitMode(AnalysisMode):
         return self.ch_combo.currentIndex()
 
     def _on_channel_changed(self, *args):
-        # re-display from the last capture for the newly selected channel
+        # The dashed fit overlay must live on the same ViewBox as the channel
+        # it's fitting; A/B render on the left VB, C/D on the right.
+        self._attach_fit_to_selected()
         cap = self.host.controller.last_capture
         if cap is not None:
             t, channels = cap
             self.on_frame(t, channels, None)
+
+    def _attach_fit_to_selected(self):
+        target = self.host._viewbox_for(self._selected())
+        if self._fit_vb is target:
+            return
+        if self._fit_vb is not None:
+            self._fit_vb.removeItem(self.fit_curve)
+        target.addItem(self.fit_curve)
+        self._fit_vb = target
 
     def activate(self):
         # default to the first enabled channel
@@ -188,9 +201,7 @@ class LorentzianFitMode(AnalysisMode):
             if self.host.controller.config.enabled[i]:
                 self.ch_combo.setCurrentIndex(i)
                 break
-        if not self._on_plot:
-            self.host.plot.addItem(self.fit_curve)
-            self._on_plot = True
+        self._attach_fit_to_selected()
         cap = self.host.controller.last_capture
         if cap is not None:
             t, channels = cap
@@ -199,9 +210,9 @@ class LorentzianFitMode(AnalysisMode):
             self._show_only_selected_blank()
 
     def deactivate(self):
-        if self._on_plot:
-            self.host.plot.removeItem(self.fit_curve)
-            self._on_plot = False
+        if self._fit_vb is not None:
+            self._fit_vb.removeItem(self.fit_curve)
+            self._fit_vb = None
         self.fit_curve.setData([], [])
 
     def _show_only_selected_blank(self):

@@ -16,7 +16,12 @@ and demo without a scope attached.
 ## Features
 
 - **Live readout** — continuous (`Run`) or one-shot (`Single`) acquisition of up
-  to four channels, drawn on a fast PyQtGraph plot with per-axis drag-zoom.
+  to four channels, drawn on a fast PyQtGraph plot. **Every channel has its own
+  ViewBox**, so each one renders at its own programmed range — zooming A does
+  not rescale B (and zooming C does not rescale D). A/B share the **left**
+  axis (whichever was pressed last is what the tick labels mean); C/D share
+  the **right**. Mouse drag-zoom on the plot is display-only — it never
+  changes the programmed acquisition window or channel range.
 - **Mode-switchable analysis** — a Mode selector swaps the bottom of the control
   panel and what the plot shows:
   - **Free View** — every enabled channel, with autoscale and save.
@@ -26,9 +31,12 @@ and demo without a scope attached.
     pane (amplitude V or ASD V/√Hz, linear or dB, selectable window).
 - **Notebook-friendly analysis** — `analysis.py` is pure numpy/scipy (no Qt), so
   the same math the GUI uses imports directly into a notebook.
-- **Simulation mode** — `--simulate` synthesizes noisy waveforms (including a
-  Lorentzian resonance and a TTL trigger reference) so the whole app runs with no
-  DLL or hardware.
+- **Simulation mode** — `--simulate` synthesizes a heterodyne-flavored test
+  pattern (A/B: ±1 V sine I/Q pair at 10 kHz; C: 1 ms train of 200 µs-FWHM
+  Lorentzian peaks; D: 0/+2 V TTL trigger reference) at *absolute* amplitudes
+  independent of the programmed range, so zooming behaves the same as on real
+  hardware (tightening a range below the signal rails the trace). The whole app
+  runs with no DLL or hardware.
 
 ---
 
@@ -89,13 +97,46 @@ The left panel holds the shared scope settings; the right pane is the live plot.
 - **Connection** — serial number + Connect/Disconnect; status line.
 - **Acquisition** — acq mode: `Auto`, `Triggered`, or `Single`.
 - **Trigger** — channel, level (V), slope (Rising/Falling).
-- **Time base** — sampling rate (400 MHz … 100 kHz), start/stop time (ms); shows
-  the resulting sample count `N`.
-- **Channels** — per-channel enable, min/max range (V), and AC/DC coupling.
-- **Mode** — selects the analysis mode (below).
+- **Time base** — sampling rate (400 MHz … 100 kHz) and the resulting sample
+  count `N`. The actual window (start/stop) is set with the time cluster on
+  the plot (see below).
+- **Channels** — per row: enable checkbox, color-coded channel label, AC/DC
+  coupling. The per-channel voltage range is set with the cluster overlaid on
+  the matching plot corner (see below).
+- **Mode** — selects the analysis mode.
+
+**On the plot (zoom / pan / reset clusters):**
+
+Each axis has a 5-button cluster pinned to it. The button labels describe how
+the **signal** moves on screen, not the underlying range:
+
+- `-` zoom out 1.5×, `+` zoom in 1.5×, `R` reset to the startup value.
+- For voltage: `v` pans the signal down by ¼ span, `^` pans it up.
+- For time: `<` pans the signal left in the window, `>` pans it right.
+
+Placement:
+
+- **A (red)** → top-left of plot, **B (blue)** → bottom-left
+  (both drive the **left** Y-axis).
+- **C (green)** → top-right, **D (orange)** → bottom-right
+  (both drive the **right** Y-axis).
+- **Time** → centered horizontally just below the bottom axis.
+
+Each Y-axis is tinted *and relabeled* (`Voltage A` / `Voltage B` on the left,
+`Voltage C` / `Voltage D` on the right) to whichever channel on its side was
+pressed most recently. The tick labels always belong to a single named
+channel, and that channel's ViewBox is what mouse-drag on the axis
+manipulates. Pressing the other channel on the same side leaves the displayed
+range of the first untouched — only its own ViewBox moves.
+
+Mouse pan/zoom on the data area stays display-only; only the cluster buttons
+move the underlying programmed config that gets pushed to hardware.
+Endpoints are silently clamped at ±100 V (and to ≥ 2 samples for the time
+window).
 
 **Default startup config:** ±2.5 V DC-coupled on all four channels, 1 MHz
-sampling, a ±500 µs window (N = 1000 samples).
+sampling, a ±500 µs window (N = 1000 samples). The Reset (`R`) button on each
+cluster returns it to whatever the config was at window startup.
 
 ### Modes
 

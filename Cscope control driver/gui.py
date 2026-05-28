@@ -53,28 +53,131 @@ class AcquisitionWorker(QtCore.QThread):
 class HoverAxis(pg.AxisItem):
     """Axis that darkens on hover, signaling it's the one a drag-zoom will scale.
 
-    pyqtgraph already zooms a single axis when you drag on it; this just adds the
-    visual cue for which axis is under the cursor."""
+    The 'normal' (non-hovered) color is per-instance so it can be re-tinted to
+    a channel color via set_normal_color(); the Y axes use this to follow
+    whichever channel on their side was most recently programmed."""
 
-    NORMAL = (120, 120, 120)
     HOVER = (0, 0, 0)
 
     def __init__(self, orientation, **kwargs):
         super().__init__(orientation, **kwargs)
         self.setAcceptHoverEvents(True)
-        self._apply(self.NORMAL, 1)
+        self._normal_color = (120, 120, 120)
+        self._apply(self._normal_color, 1)
 
     def _apply(self, color, width):
         self.setPen(pg.mkPen(color, width=width))
         self.setTextPen(pg.mkPen(color))
+
+    def set_normal_color(self, color):
+        """Set the color the axis returns to after a hover-leave."""
+        self._normal_color = color
+        self._apply(self._normal_color, 1)
 
     def hoverEnterEvent(self, event):
         self._apply(self.HOVER, 2)
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
-        self._apply(self.NORMAL, 1)
+        self._apply(self._normal_color, 1)
         super().hoverLeaveEvent(event)
+
+
+class ButtonCluster(QtWidgets.QWidget):
+    """Compact 5-button pad — pan-, zoom out, reset, zoom in, pan+.
+
+    Drives a *programmed* axis range (time or per-channel voltage). Mouse pan/
+    zoom on the plot stays display-only; only these buttons move the underlying
+    config. With show_readout=True a small numeric label is shown between the
+    two pan buttons (used for non-embedded callers); embedded-on-plot clusters
+    pass show_readout=False so the data area stays clean — the axis ticks
+    already display the programmed range.
+
+    orientation: "h" for time-axis (pan labels '<' '>'), "v" for voltage ('v' '^').
+    color:       optional CSS color tinting border + text to match a channel.
+    """
+
+    zoomIn = QtCore.Signal()
+    zoomOut = QtCore.Signal()
+    panNeg = QtCore.Signal()
+    panPos = QtCore.Signal()
+    reset = QtCore.Signal()
+
+    def __init__(self, orientation="h", color=None, show_readout=True, parent=None):
+        super().__init__(parent)
+        if orientation == "v":
+            pan_neg_lbl, pan_pos_lbl = "v", "^"
+            # Wiring inverts the sign so 'v' visually moves the signal down.
+            pan_neg_tip, pan_pos_tip = "Pan signal down by 1/4 span", "Pan signal up by 1/4 span"
+        else:
+            pan_neg_lbl, pan_pos_lbl = "<", ">"
+            pan_neg_tip, pan_pos_tip = "Pan signal left by 1/4 span", "Pan signal right by 1/4 span"
+
+        style = ""
+        if color is not None:
+            style = (f"QToolButton {{ border: 2px solid {color}; color: {color}; "
+                     f"font-weight: bold; border-radius: 3px; "
+                     f"background: rgba(255,255,255,200); }} "
+                     f"QToolButton:pressed {{ background: {color}; color: white; }}")
+
+        def mkbtn(text, tip, signal):
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFixedSize(24, 22)
+            b.setAutoRaise(False)
+            if style:
+                b.setStyleSheet(style)
+            b.clicked.connect(signal.emit)
+            return b
+
+        self._btn_zoom_out = mkbtn("-", "Zoom out 1.5x", self.zoomOut)
+        self._btn_zoom_in = mkbtn("+", "Zoom in 1.5x", self.zoomIn)
+        self._btn_reset = mkbtn("R", "Reset to default", self.reset)
+        self._btn_pan_neg = mkbtn(pan_neg_lbl, pan_neg_tip, self.panNeg)
+        self._btn_pan_pos = mkbtn(pan_pos_lbl, pan_pos_tip, self.panPos)
+
+        self._show_readout = show_readout
+        if show_readout:
+            self._readout = QtWidgets.QLabel("")
+            self._readout.setAlignment(QtCore.Qt.AlignCenter)
+            if color is not None:
+                self._readout.setStyleSheet(f"color: {color}; font-weight: bold;")
+            g = QtWidgets.QGridLayout(self)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setHorizontalSpacing(3)
+            g.setVerticalSpacing(2)
+            g.addWidget(self._btn_zoom_out, 0, 0)
+            g.addWidget(self._btn_zoom_in, 0, 1)
+            g.addWidget(self._btn_reset, 0, 2)
+            g.addWidget(self._btn_pan_neg, 1, 0)
+            g.addWidget(self._readout, 1, 1)
+            g.addWidget(self._btn_pan_pos, 1, 2)
+        else:
+            self._readout = None
+            # Compact 5-button strip, oriented to match the axis the cluster
+            # serves. Voltage ('v' orientation) stacks vertically so '^' sits
+            # at the top and 'v' at the bottom — pan buttons map to actual
+            # screen direction. Time ('h' orientation) stays horizontal so
+            # '<' is on the left and '>' on the right under the time axis.
+            if orientation == "v":
+                lay = QtWidgets.QVBoxLayout(self)
+                order = [self._btn_pan_pos, self._btn_zoom_in,
+                         self._btn_reset,
+                         self._btn_zoom_out, self._btn_pan_neg]
+            else:
+                lay = QtWidgets.QHBoxLayout(self)
+                order = [self._btn_pan_neg, self._btn_zoom_out,
+                         self._btn_reset,
+                         self._btn_zoom_in, self._btn_pan_pos]
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(3)
+            for w in order:
+                lay.addWidget(w)
+
+    def set_readout(self, text):
+        if self._readout is not None:
+            self._readout.setText(text)
 
 
 class ScopeWindow(QtWidgets.QMainWindow):
@@ -89,6 +192,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.resize(1140, 720)
 
         self.controller = ScopeController(simulate=simulate)
+        # Snapshot the startup config so Reset buttons can restore start/stop and
+        # per-channel ranges to where they began (instead of hard-coded constants).
+        self._config_defaults = self.controller.config.copy()
         self.worker = None
         self._continuous = False     # is the active run a continuous one?
 
@@ -171,7 +277,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         tg.addWidget(self.trig_slope_combo, 2, 1)
         v.addWidget(trig_box)
 
-        # time base
+        # time base — rate + sample count only; the zoom/pan/reset cluster lives
+        # on the plot itself (see _build_plot_overlays).
         tb_box = QtWidgets.QGroupBox("Time base")
         bg = QtWidgets.QGridLayout(tb_box)
         self.rate_combo = QtWidgets.QComboBox()
@@ -179,58 +286,34 @@ class ScopeWindow(QtWidgets.QMainWindow):
                              400e3, 200e3, 100e3]
         self.rate_combo.addItems([self.fmt_hz(r) for r in self._rate_values])
         self.rate_combo.currentIndexChanged.connect(self._on_config_changed)
-        self.start_spin = QtWidgets.QDoubleSpinBox()
-        self.start_spin.setRange(-1000.0, 1000.0)
-        self.start_spin.setDecimals(3)
-        self.start_spin.setSuffix(" ms")
-        self.start_spin.valueChanged.connect(self._on_config_changed)
-        self.stop_spin = QtWidgets.QDoubleSpinBox()
-        self.stop_spin.setRange(-1000.0, 1000.0)
-        self.stop_spin.setDecimals(3)
-        self.stop_spin.setSuffix(" ms")
-        self.stop_spin.valueChanged.connect(self._on_config_changed)
         self.nsamp_lbl = QtWidgets.QLabel("")
         bg.addWidget(QtWidgets.QLabel("Rate"), 0, 0)
         bg.addWidget(self.rate_combo, 0, 1)
-        bg.addWidget(QtWidgets.QLabel("Start"), 1, 0)
-        bg.addWidget(self.start_spin, 1, 1)
-        bg.addWidget(QtWidgets.QLabel("Stop"), 2, 0)
-        bg.addWidget(self.stop_spin, 2, 1)
-        bg.addWidget(self.nsamp_lbl, 3, 0, 1, 2)
+        bg.addWidget(self.nsamp_lbl, 1, 0, 1, 2)
         v.addWidget(tb_box)
 
-        # channels
+        # channels — enable + coupling. Per-channel range is set with the
+        # color-coded button cluster overlaid at the matching plot corner
+        # (A top-left, B bottom-left, C top-right, D bottom-right).
         ch_box = QtWidgets.QGroupBox("Channels")
         cg2 = QtWidgets.QGridLayout(ch_box)
         cg2.addWidget(QtWidgets.QLabel("On"), 0, 0)
         cg2.addWidget(QtWidgets.QLabel("Ch"), 0, 1)
-        cg2.addWidget(QtWidgets.QLabel("Min"), 0, 2)
-        cg2.addWidget(QtWidgets.QLabel("Max"), 0, 3)
-        cg2.addWidget(QtWidgets.QLabel("Cpl"), 0, 4)
+        cg2.addWidget(QtWidgets.QLabel("Cpl"), 0, 2)
         self.ch_enable = []
-        self.ch_min = []
-        self.ch_max = []
         self.ch_coupling = []
         for i, name in enumerate(CH_NAMES):
             en = QtWidgets.QCheckBox()
             en.toggled.connect(self._on_config_changed)
             lbl = QtWidgets.QLabel(name)
             lbl.setStyleSheet(f"color: {CH_COLORS[i]}; font-weight: bold;")
-            mn = QtWidgets.QDoubleSpinBox(); mn.setRange(-100, 100); mn.setDecimals(3)
-            mn.valueChanged.connect(self._on_config_changed)
-            mx = QtWidgets.QDoubleSpinBox(); mx.setRange(-100, 100); mx.setDecimals(3)
-            mx.valueChanged.connect(self._on_config_changed)
             cpl = QtWidgets.QComboBox(); cpl.addItems(["AC", "DC"])
             cpl.currentTextChanged.connect(self._on_config_changed)
             row = i + 1
             cg2.addWidget(en, row, 0)
             cg2.addWidget(lbl, row, 1)
-            cg2.addWidget(mn, row, 2)
-            cg2.addWidget(mx, row, 3)
-            cg2.addWidget(cpl, row, 4)
+            cg2.addWidget(cpl, row, 2)
             self.ch_enable.append(en)
-            self.ch_min.append(mn)
-            self.ch_max.append(mx)
             self.ch_coupling.append(cpl)
         v.addWidget(ch_box)
 
@@ -253,18 +336,73 @@ class ScopeWindow(QtWidgets.QMainWindow):
     def _build_plot(self):
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget(axisItems={"bottom": HoverAxis("bottom"),
-                                             "left": HoverAxis("left")})
+                                             "left": HoverAxis("left"),
+                                             "right": HoverAxis("right")})
         self.plot.setBackground("w")
         self.plot.showGrid(x=True, y=True, alpha=0.3)
         self.plot.setLabel("bottom", "Time", units="s")
-        self.plot.setLabel("left", "Voltage", units="V")
+        # Axis labels start as their primary channel (left → A, right → C) and
+        # follow whichever channel on that side was pressed last (see _tint_axis).
+        self.plot.setLabel("left", "Voltage A", units="V")
+        self.plot.setLabel("right", "Voltage C", units="V")
+        self.plot.showAxis("right")
         self.plot.addLegend()
+
+        # One ViewBox per channel, all stacked in the same on-screen rectangle
+        # and X-linked, so each channel has a fully independent Y range —
+        # zooming A no longer drags B's display along with it. The left axis is
+        # re-linked between A and B (and the right between C and D) by
+        # _tint_axis whenever the user presses that channel's cluster.
+        vb_a = self.plot.getViewBox()        # main; A
+        vb_b = pg.ViewBox()
+        vb_c = pg.ViewBox()
+        vb_d = pg.ViewBox()
+        self._vb = [vb_a, vb_b, vb_c, vb_d]
+        for vb in (vb_b, vb_c, vb_d):
+            self.plot.scene().addItem(vb)
+            vb.setXLink(vb_a)
+        self.plot.getAxis("left").linkToView(vb_a)   # A on left initially
+        self.plot.getAxis("right").linkToView(vb_c)  # C on right initially
+
+        def _sync_views():
+            rect = vb_a.sceneBoundingRect()
+            for vb in (vb_b, vb_c, vb_d):
+                vb.setGeometry(rect)
+                vb.linkedViewChanged(vb_a, vb.XAxis)
+        vb_a.sigResized.connect(_sync_views)
+        self._sync_views = _sync_views
+
         self.curves = []
         for i, name in enumerate(CH_NAMES):
-            curve = self.plot.plot(pen=pg.mkPen(CH_COLORS[i], width=1), name=f"Ch {name}")
+            curve = pg.PlotDataItem(pen=pg.mkPen(CH_COLORS[i], width=1),
+                                    name=f"Ch {name}")
             curve.setDownsampling(auto=True)
             curve.setClipToView(True)
+            self._vb[i].addItem(curve)
+            if i != 0:
+                # Only items in the main VB auto-register; register the rest.
+                self.plot.plotItem.legend.addItem(curve, f"Ch {name}")
             self.curves.append(curve)
+        _sync_views()
+
+        # Build the corner channel clusters as children of self.plot, and the
+        # time cluster as a centered row directly under the plot.
+        self._build_plot_overlays()
+
+        # Wrap the plot + time-row in one widget so the splitter sees them as
+        # a single pane (the FFT pane is the splitter's other half).
+        plot_pane = QtWidgets.QWidget()
+        pp = QtWidgets.QVBoxLayout(plot_pane)
+        pp.setContentsMargins(0, 0, 0, 0)
+        pp.setSpacing(2)
+        pp.addWidget(self.plot, 1)
+        time_row = QtWidgets.QWidget()
+        tr = QtWidgets.QHBoxLayout(time_row)
+        tr.setContentsMargins(0, 0, 0, 4)
+        tr.addStretch(1)
+        tr.addWidget(self.time_cluster)
+        tr.addStretch(1)
+        pp.addWidget(time_row, 0)
 
         # FFT plot lives in the bottom pane, hidden until FFT View mode reveals it.
         self.fft_plot = pg.PlotWidget(axisItems={"bottom": HoverAxis("bottom"),
@@ -276,9 +414,62 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.fft_plot.hide()
 
         self.plot_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.plot_splitter.addWidget(self.plot)
+        self.plot_splitter.addWidget(plot_pane)
         self.plot_splitter.addWidget(self.fft_plot)
         return self.plot_splitter
+
+    def _build_plot_overlays(self):
+        """Create the five button clusters and pin the four channel ones to the
+        plot corners. The time cluster is placed into a centered row by the
+        caller; here we only construct it.
+
+        Pan-direction wiring is inverted on purpose: the user thinks of the
+        signal moving, not the range. Clicking 'v' should make the trace
+        appear lower on screen, which means the displayed range shifts up
+        (frac > 0). Same for '<' on time."""
+        self.ch_cluster = []
+        for i in range(4):
+            cl = ButtonCluster("v", color=CH_COLORS[i], show_readout=False,
+                               parent=self.plot)
+            cl.zoomIn.connect(lambda _ch=i: self._volt_zoom(_ch, 1.0 / 1.5))
+            cl.zoomOut.connect(lambda _ch=i: self._volt_zoom(_ch, 1.5))
+            cl.panNeg.connect(lambda _ch=i: self._volt_pan(_ch, +0.25))  # signal down → range up
+            cl.panPos.connect(lambda _ch=i: self._volt_pan(_ch, -0.25))  # signal up   → range down
+            cl.reset.connect(lambda _ch=i: self._volt_reset(_ch))
+            cl.raise_()
+            self.ch_cluster.append(cl)
+
+        self.time_cluster = ButtonCluster("h", show_readout=False)
+        self.time_cluster.zoomIn.connect(lambda: self._time_zoom(1.0 / 1.5))
+        self.time_cluster.zoomOut.connect(lambda: self._time_zoom(1.5))
+        self.time_cluster.panNeg.connect(lambda: self._time_pan(+0.25))  # signal left  → range later
+        self.time_cluster.panPos.connect(lambda: self._time_pan(-0.25))  # signal right → range earlier
+        self.time_cluster.reset.connect(self._time_reset)
+
+        # Reposition the corner clusters whenever the plot widget resizes.
+        self.plot.installEventFilter(self)
+        self._reposition_overlays()
+
+    def _reposition_overlays(self):
+        """Pin A,B,C,D clusters to plot corners with a small inward pad."""
+        if not hasattr(self, "ch_cluster") or not self.ch_cluster:
+            return
+        pad = 6
+        w, h = self.plot.width(), self.plot.height()
+        for cl in self.ch_cluster:
+            cl.adjustSize()
+        a, b, c, d = self.ch_cluster
+        a.move(pad, pad)                                   # A: top-left
+        b.move(pad, h - b.height() - pad)                  # B: bottom-left
+        c.move(w - c.width() - pad, pad)                   # C: top-right
+        d.move(w - d.width() - pad, h - d.height() - pad)  # D: bottom-right
+        for cl in self.ch_cluster:
+            cl.raise_()
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "plot", None) and event.type() == QtCore.QEvent.Resize:
+            self._reposition_overlays()
+        return super().eventFilter(obj, event)
 
     # ---------- config <-> widgets ----------
     def _sync_controls_to_config(self):
@@ -292,15 +483,21 @@ class ScopeWindow(QtWidgets.QMainWindow):
         nearest = min(range(len(self._rate_values)),
                       key=lambda k: abs(self._rate_values[k] - cfg.sampling_rate_hz))
         self.rate_combo.setCurrentIndex(nearest)
-        self.start_spin.setValue(cfg.start_time_s * 1e3)
-        self.stop_spin.setValue(cfg.stop_time_s * 1e3)
         for i in range(4):
             self.ch_enable[i].setChecked(cfg.enabled[i])
-            self.ch_min[i].setValue(cfg.ranges[i][0])
-            self.ch_max[i].setValue(cfg.ranges[i][1])
             self.ch_coupling[i].setCurrentText(cfg.couplings[i])
         self._loading = False
+        self._refresh_cluster_readouts()
         self._update_nsamp_label()
+        # Snap every per-channel ViewBox to its programmed Y range, plus the
+        # shared X axis to the programmed time window.
+        self.plot.setXRange(cfg.start_time_s, cfg.stop_time_s, padding=0)
+        for i in range(4):
+            self._vb[i].setYRange(*cfg.ranges[i], padding=0)
+        # Color/link the left axis to A and the right axis to C as the startup
+        # default so the tick labels are meaningful on first frame.
+        self._tint_axis(0)
+        self._tint_axis(2)
 
     def _read_config_from_controls(self):
         cfg = self.controller.config
@@ -310,11 +507,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
         cfg.trigger_level_v = self.trig_level_spin.value()
         cfg.trigger_slope = self.trig_slope_combo.currentText()
         cfg.sampling_rate_hz = self._rate_values[self.rate_combo.currentIndex()]
-        cfg.start_time_s = self.start_spin.value() * 1e-3
-        cfg.stop_time_s = self.stop_spin.value() * 1e-3
         for i in range(4):
             cfg.enabled[i] = self.ch_enable[i].isChecked()
-            cfg.ranges[i] = (self.ch_min[i].value(), self.ch_max[i].value())
             cfg.couplings[i] = self.ch_coupling[i].currentText()
 
     def _on_config_changed(self, *args):
@@ -329,6 +523,125 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
     def _update_nsamp_label(self):
         self.nsamp_lbl.setText(f"N = {self.controller.config.num_samples:,} samples")
+
+    # ---------- programmed-axis (button) controls ----------
+    @staticmethod
+    def _zoom_bounds(lo, hi, factor):
+        c = (lo + hi) / 2.0
+        new = (hi - lo) * factor / 2.0
+        return c - new, c + new
+
+    @staticmethod
+    def _pan_bounds(lo, hi, frac):
+        shift = (hi - lo) * frac
+        return lo + shift, hi + shift
+
+    def _time_zoom(self, factor):
+        cfg = self.controller.config
+        cfg.start_time_s, cfg.stop_time_s = self._zoom_bounds(
+            cfg.start_time_s, cfg.stop_time_s, factor)
+        self._commit_time()
+
+    def _time_pan(self, frac):
+        cfg = self.controller.config
+        cfg.start_time_s, cfg.stop_time_s = self._pan_bounds(
+            cfg.start_time_s, cfg.stop_time_s, frac)
+        self._commit_time()
+
+    def _time_reset(self):
+        cfg = self.controller.config
+        cfg.start_time_s = self._config_defaults.start_time_s
+        cfg.stop_time_s = self._config_defaults.stop_time_s
+        self._commit_time()
+
+    def _volt_zoom(self, ch, factor):
+        cfg = self.controller.config
+        lo, hi = cfg.ranges[ch]
+        cfg.ranges[ch] = self._zoom_bounds(lo, hi, factor)
+        self._commit_volt(ch)
+
+    def _volt_pan(self, ch, frac):
+        cfg = self.controller.config
+        lo, hi = cfg.ranges[ch]
+        cfg.ranges[ch] = self._pan_bounds(lo, hi, frac)
+        self._commit_volt(ch)
+
+    def _volt_reset(self, ch):
+        cfg = self.controller.config
+        cfg.ranges[ch] = tuple(self._config_defaults.ranges[ch])
+        self._commit_volt(ch)
+
+    def _commit_time(self):
+        """Clamp time bounds, push to hardware, snap display X, update readout."""
+        cfg = self.controller.config
+        lo, hi = cfg.start_time_s, cfg.stop_time_s
+        # clamp endpoints to the old spinbox range (1 s either side)
+        lo = max(-1.0, min(1.0, lo))
+        hi = max(-1.0, min(1.0, hi))
+        # enforce at least 2 samples worth of duration
+        min_span = 2.0 / max(cfg.sampling_rate_hz, 1.0)
+        if hi - lo < min_span:
+            c = (lo + hi) / 2.0
+            lo, hi = c - min_span / 2.0, c + min_span / 2.0
+        cfg.start_time_s, cfg.stop_time_s = lo, hi
+        self.controller.mark_dirty()
+        self.plot.setXRange(lo, hi, padding=0)
+        self._update_nsamp_label()
+        self._refresh_cluster_readouts()
+
+    def _commit_volt(self, ch):
+        """Clamp voltage bounds, push to hardware, snap only this channel's VB."""
+        cfg = self.controller.config
+        lo, hi = cfg.ranges[ch]
+        lo = max(-100.0, min(100.0, lo))
+        hi = max(-100.0, min(100.0, hi))
+        if hi - lo < 1e-3:
+            c = (lo + hi) / 2.0
+            lo, hi = c - 5e-4, c + 5e-4
+        cfg.ranges[ch] = (lo, hi)
+        self.controller.mark_dirty()
+        # Only this channel's ViewBox moves — the other channel on the same
+        # axis side keeps its own programmed range untouched.
+        self._vb[ch].setYRange(lo, hi, padding=0)
+        self._tint_axis(ch)
+        self._refresh_cluster_readouts()
+
+    def _tint_axis(self, ch):
+        """Re-link the appropriate axis to ch's ViewBox, color it the channel's
+        pen color, and relabel it 'Voltage <name>' so the tick scale always
+        belongs to a single named channel."""
+        side = "left" if ch < 2 else "right"
+        axis = self.plot.getAxis(side)
+        axis.linkToView(self._vb[ch])
+        # pyqtgraph's linkToView only connects signals — it does not push the
+        # newly-linked view's current range. Without this manual sync, the
+        # tick labels stay frozen on the previous channel's range until the
+        # next range change fires.
+        axis.linkedViewChanged(self._vb[ch])
+        if isinstance(axis, HoverAxis):
+            axis.set_normal_color(CH_COLORS[ch])
+        self.plot.setLabel(side, f"Voltage {CH_NAMES[ch]}", units="V")
+
+    def _viewbox_for(self, ch):
+        """Each channel has its own ViewBox so ranges are fully independent."""
+        return self._vb[ch]
+
+    def _add_overlay(self, item, ch):
+        """Add an overlay item (e.g. a fit curve) to the right channel's VB."""
+        self._viewbox_for(ch).addItem(item)
+
+    def _refresh_cluster_readouts(self):
+        cfg = self.controller.config
+        span_ms_lo = cfg.start_time_s * 1e3
+        span_ms_hi = cfg.stop_time_s * 1e3
+        self.time_cluster.set_readout(f"{span_ms_lo:+.3g} – {span_ms_hi:+.3g} ms")
+        for i in range(4):
+            lo, hi = cfg.ranges[i]
+            if abs(lo + hi) < 1e-9 and hi > 0:
+                txt = f"±{hi:.3g} V"
+            else:
+                txt = f"{lo:.3g} / {hi:.3g} V"
+            self.ch_cluster[i].set_readout(txt)
 
     # ---------- actions ----------
     def _toggle_connect(self):
@@ -442,21 +755,22 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.plot.setXRange(float(t[0]), float(t[-1]), padding=0)
 
     def autoscale_y(self):
-        """Fit the y-axis to the measured min/max across enabled channels."""
+        """Fit each channel's ViewBox to that channel's own min/max — fully
+        independent now that A/B/C/D each own a ViewBox."""
         cap = self.controller.last_capture
         if cap is None:
             return
         _, channels = cap
-        ys = [channels[i] for i in range(4)
-              if self.controller.config.enabled[i] and len(channels[i])]
-        if not ys:
-            return
-        ymin = min(float(np.min(y)) for y in ys)
-        ymax = max(float(np.max(y)) for y in ys)
-        if ymin == ymax:
-            pad = abs(ymin) * 0.1 or 0.5
-            ymin, ymax = ymin - pad, ymax + pad
-        self.plot.setYRange(ymin, ymax, padding=0.05)
+        cfg = self.controller.config
+        for i in range(4):
+            y = channels[i]
+            if not cfg.enabled[i] or len(y) == 0:
+                continue
+            ymin, ymax = float(np.min(y)), float(np.max(y))
+            if ymin == ymax:
+                pad = abs(ymin) * 0.1 or 0.5
+                ymin, ymax = ymin - pad, ymax + pad
+            self._vb[i].setYRange(ymin, ymax, padding=0.05)
 
     def show_fft_panel(self, visible):
         """Reveal/hide the bottom FFT pane (waveform ~2/3, FFT ~1/3 when shown)."""

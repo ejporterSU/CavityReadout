@@ -59,7 +59,13 @@ def acquisition_metrics(t):
 
 class MockScope:
     """Drop-in stand-in for `CScope`: same methods the controller calls, but it
-    synthesizes noisy sine waves so the whole app runs with no DLL or hardware."""
+    synthesizes a heterodyne-flavored test pattern so the whole app runs with
+    no DLL or hardware.
+
+    Signals are at **absolute amplitudes** independent of the channel range —
+    the range only controls railing (clipping), the way real hardware behaves.
+    Synthesizing relative-to-range was previously hiding the fact that zoom
+    changes the displayed window, not the underlying signal."""
 
     MAX_DISPLAY_SAMPLES = 200_000  # keep synthetic frames light for a smooth live loop
 
@@ -73,8 +79,6 @@ class MockScope:
         self.trig_slope = "Rising"
         self._connected = False
         self._rng = np.random.default_rng()
-        # per-channel synthetic tone frequencies (Hz)
-        self._freqs = [2.5e6, 3.6e6, 1.0e6, 1.0e3]
 
     # --- mirror the CScope API the controller uses ---
     def connect(self, **kwargs):
@@ -111,25 +115,33 @@ class MockScope:
         n = min(n_full, self.MAX_DISPLAY_SAMPLES)
         t = np.linspace(self.start, self.stop, n)
 
+        # A, B: I/Q pair, 1 V amplitude, 10 kHz; B lags A by 90 degrees.
+        # 10 kHz gives ~100 samples/cycle at default 1 MHz sampling rate, so the
+        # waveforms display cleanly out of the box (well above Nyquist).
+        f_sine = 10e3
+        a_sig = 1.0 * np.sin(2 * np.pi * f_sine * t)
+        b_sig = 1.0 * np.sin(2 * np.pi * f_sine * t - np.pi / 2)
+
+        # C: train of Lorentzian peaks for the cavity-fit demo — +1 V on a 0 V
+        # baseline, 200 us FWHM, repeating every 1 ms. Phase-fold time so peaks
+        # land at integer multiples of the period (one centered in the default
+        # +/-500 us window).
+        period = 1e-3
+        fwhm = 200e-6
+        hwhm = fwhm / 2.0
+        tau = (t + period / 2.0) % period - period / 2.0
+        c_sig = 1.0 * hwhm**2 / (tau**2 + hwhm**2)
+
+        # D: TTL-ish trigger reference — 0 V / +2 V square at 1 kHz. Kept inside
+        # the default +/-2.5 V range so it isn't railed out of the box.
+        d_sig = np.where(np.sin(2 * np.pi * 1e3 * t) >= 0, 2.0, 0.0)
+
+        sigs = [a_sig, b_sig, c_sig, d_sig]
         channels = []
-        for i in range(4):
+        for i, sig in enumerate(sigs):
+            # 20 mV RMS noise floor; absolute, not range-relative.
+            noise = self._rng.normal(0.0, 0.02, size=n)
             lo, hi = self.ranges[i]
-            amp = 0.4 * (hi - lo) / 2.0
-            f = self._freqs[i]
-            if i == 3:
-                # channel D: a TTL-ish square (trigger reference)
-                sig = np.where(np.sin(2 * np.pi * f * t) >= 0, hi * 0.8, lo * 0.1)
-            elif i == 2:
-                # channel C: a Lorentzian cavity resonance vs. the sweep axis,
-                # so the GUI's Lorentzian-fit mode has something to fit in --simulate.
-                t0 = self.start + 0.5 * duration         # centered in the window
-                fwhm = 0.08 * duration                   # ~8% of the span
-                hwhm = fwhm / 2.0
-                sig = amp * hwhm**2 / ((t - t0)**2 + hwhm**2)
-            else:
-                phase = self._rng.uniform(0, 2 * np.pi)
-                sig = amp * np.sin(2 * np.pi * f * t + phase)
-            noise = self._rng.normal(0.0, 0.04 * (hi - lo) / 2.0, size=n)
             channels.append(np.clip(sig + noise, lo, hi))
 
         return [t, tuple(channels)]
