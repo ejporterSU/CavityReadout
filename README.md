@@ -29,6 +29,11 @@ and demo without a scope attached.
     center, FWHM, amplitude, offset (each ±1σ), plus R²/RMS.
   - **FFT View** — a live single-channel spectrum analyzer in a bottom split
     pane (amplitude V or ASD V/√Hz, linear or dB, selectable window).
+  - **VRS Alignment** — sweep the cavity frequency (stepped externally) and fit
+    each triggered shot's two TTL-gated windows (a double Lorentzian doublet, then
+    a single bare-cavity peak). Plots the doublet-vs-single asymmetry (kHz) vs.
+    cavity frequency, line-fits it, and reports the zero-crossing — the cavity
+    frequency where the atomic line is aligned.
 - **Notebook-friendly analysis** — `analysis.py` is pure numpy/scipy (no Qt), so
   the same math the GUI uses imports directly into a notebook.
 - **Simulation mode** — `--simulate` synthesizes a heterodyne-flavored test
@@ -53,9 +58,10 @@ Cscope control driver/
   controller.py                  ScopeConfig + ScopeController (+ MockScope): a
                                  reusable, GUI-free control layer
   analysis.py                    Pure numpy/scipy analysis (fit_lorentzian,
-                                 compute_spectrum) — no Qt, notebook-importable
+                                 compute_spectrum, fit_window_asymmetry) — no Qt,
+                                 notebook-importable
   analysis_modes.py              Mode framework: AnalysisMode base + FreeViewMode,
-                                 LorentzianFitMode, FFTMode
+                                 LorentzianFitMode, FFTMode, VRSAlignmentMode
   gui.py                         The PyQtGraph readout app (ScopeWindow)
   CleverscopeInterface.py, T_*.py, Cleverscope*.py
                                  Vendor driver + examples (flat imports)
@@ -161,6 +167,26 @@ cluster returns it to whatever the config was at window startup.
 
   The spectrum keeps all FFT bins; the readout reports fs, Nyquist, bin spacing
   df = fs/N, and the window's equivalent noise bandwidth (ENBW).
+- **VRS Alignment** — align a VRS doublet to a bare-cavity resonance. You step the
+  cavity frequency *externally*; each triggered shot must hold two TTL-gated
+  windows on the signal channel — window 1 a double Lorentzian (the doublet),
+  window 2 a single Lorentzian (bare cavity). The asymmetry = (doublet center −
+  single center), scaled to kHz by the scan rate, is plotted vs. cavity frequency
+  on the bottom pane; a weighted line fit reports the zero-crossing (the cavity
+  frequency to move to). Controls:
+  - **Channels**: Signal + TTL
+  - **Time window**: start/stop (ms) to crop each capture (`stop ≤ start` = whole
+    capture); cropping never reconfigures the scope
+  - **TTL gating**: threshold (V), min pulse width (ms)
+  - **Scan scaling**: scan range (MHz) + scan time (ms) → the time→kHz factor
+  - **Cavity sweep**: start (MHz), step (MHz), num steps, min R²
+  - **Start Analysis** / **Reset**, with a live Total-time readout
+
+  Set the acquisition **Mode to Triggered** first — Start arms a continuous
+  triggered run and treats every *successful* shot as the next sweep point
+  (advancing once per trigger as you retune the cavity). Failed shots (wrong TTL
+  count, short window, bad/low-R² fit) are reported and do **not** advance, so you
+  can retrigger at the same setting.
 
 ### Display point cap
 

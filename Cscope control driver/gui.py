@@ -15,7 +15,8 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from controller import ScopeController, CH_NAMES, CH_COLORS, ACQ_MODES
-from analysis_modes import FreeViewMode, LorentzianFitMode, FFTMode
+from analysis_modes import (FreeViewMode, LorentzianFitMode, FFTMode,
+                            VRSAlignmentMode)
 
 
 class AcquisitionWorker(QtCore.QThread):
@@ -200,7 +201,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
         # analysis modes (Free View + analysis suite); registered before the
         # controls are built so their panels can populate the mode stack.
-        self.modes = [FreeViewMode(self), LorentzianFitMode(self), FFTMode(self)]
+        self.modes = [FreeViewMode(self), LorentzianFitMode(self), FFTMode(self),
+                      VRSAlignmentMode(self)]
         self.active_mode = self.modes[0]
 
         central = QtWidgets.QWidget()

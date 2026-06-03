@@ -14,12 +14,14 @@ never `import gui`, so there's no circular import. From the host they use:
 `save_display`/`save_full`, `decimate_display`, and `fmt_hz`.
 """
 
+import time
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtWidgets
 
 from controller import CH_NAMES
-from analysis import fit_lorentzian, compute_spectrum
+from analysis import fit_lorentzian, compute_spectrum, fit_window_asymmetry
 
 
 def _fmt_s(seconds):
@@ -467,3 +469,468 @@ class FFTMode(AnalysisMode):
         self.run_btn.setEnabled(connected and not running)
         self.single_btn.setEnabled(connected and not running)
         self.stop_btn.setEnabled(running and continuous)
+
+
+class VRSAlignmentMode(AnalysisMode):
+    """VRS–cavity alignment sweep.
+
+    Each triggered shot holds two TTL-gated windows on the signal channel: a
+    *double* Lorentzian (the VRS doublet) then a *single* Lorentzian (bare
+    cavity). The asymmetry = (doublet center − single center), scaled to kHz, is
+    plotted against the cavity frequency you step externally between shots; a
+    line fit gives the zero-crossing — the cavity frequency where the atomic line
+    sits on resonance.
+
+    Workflow: set the acquisition mode to "Triggered", then Start Analysis. The
+    mode arms a continuous triggered run and treats every *successful* shot as
+    the next sweep point, so the sweep advances once per trigger while you retune
+    the cavity. Failed shots (wrong TTL count, short window, bad/low-R² fit) are
+    reported and do not advance — retrigger at the same cavity setting. The
+    asymmetry-vs-frequency scatter, line fit, and zero-crossing are drawn on the
+    bottom (shared FFT) pane.
+    """
+
+    name = "VRS Alignment"
+
+    def __init__(self, host):
+        super().__init__(host)
+        # Fit overlays drawn on the signal channel's ViewBox.
+        self.double_curve = pg.PlotDataItem(
+            pen=pg.mkPen("r", width=2, style=pg.QtCore.Qt.DashLine))
+        self.single_curve = pg.PlotDataItem(
+            pen=pg.mkPen("m", width=2, style=pg.QtCore.Qt.DashLine))
+        self._sig_vb = None
+        # Secondary-plot items: asymmetry vs cavity frequency.
+        self._scatter = pg.ScatterPlotItem(size=9, brush=pg.mkBrush(30, 30, 200),
+                                            pen=pg.mkPen("k"))
+        self._errbars = pg.ErrorBarItem(pen=pg.mkPen(30, 30, 200))
+        self._fit_line = pg.PlotDataItem(
+            pen=pg.mkPen("r", width=2, style=pg.QtCore.Qt.DashLine))
+        self._href = pg.InfiniteLine(pos=0.0, angle=0,
+                                     pen=pg.mkPen((150, 150, 150),
+                                                  style=pg.QtCore.Qt.DashLine))
+        self._zero_marker = pg.InfiniteLine(
+            angle=90, pen=pg.mkPen((0, 150, 0), width=2,
+                                   style=pg.QtCore.Qt.DashLine))
+        self._zero_marker.setVisible(False)
+        self._on_plot = False
+        self._saved_labels = None
+        self._sweeping = False
+        self._t0 = None
+        self._success = []          # list of (freq_mhz, asymm_khz, err_khz)
+        self._fail_count = 0
+
+    # ---- panel ----
+    @staticmethod
+    def _spin(lo, hi, decimals, suffix, val, step=None):
+        s = QtWidgets.QDoubleSpinBox()
+        s.setRange(lo, hi)
+        s.setDecimals(decimals)
+        s.setValue(val)
+        if suffix:
+            s.setSuffix(suffix)
+        if step is not None:
+            s.setSingleStep(step)
+        return s
+
+    def build_panel(self):
+        panel = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        ch_box = QtWidgets.QGroupBox("Channels")
+        cg = QtWidgets.QGridLayout(ch_box)
+        cg.addWidget(QtWidgets.QLabel("Signal"), 0, 0)
+        self.sig_combo = QtWidgets.QComboBox()
+        self.sig_combo.addItems(CH_NAMES)
+        self.sig_combo.currentIndexChanged.connect(self._on_chan_changed)
+        cg.addWidget(self.sig_combo, 0, 1)
+        cg.addWidget(QtWidgets.QLabel("TTL"), 1, 0)
+        self.ttl_combo = QtWidgets.QComboBox()
+        self.ttl_combo.addItems(CH_NAMES)
+        self.ttl_combo.currentIndexChanged.connect(self._on_chan_changed)
+        cg.addWidget(self.ttl_combo, 1, 1)
+        v.addWidget(ch_box)
+
+        win_box = QtWidgets.QGroupBox("Time window (crop)")
+        wg = QtWidgets.QGridLayout(win_box)
+        self.win_lo = self._spin(-10000.0, 10000.0, 4, " ms", 0.0)
+        self.win_hi = self._spin(-10000.0, 10000.0, 4, " ms", 0.0)
+        tip = ("Crop captures to [start, stop] before analysis.\n"
+               "Leave stop ≤ start to use the whole capture.")
+        self.win_lo.setToolTip(tip)
+        self.win_hi.setToolTip(tip)
+        wg.addWidget(QtWidgets.QLabel("Start"), 0, 0)
+        wg.addWidget(self.win_lo, 0, 1)
+        wg.addWidget(QtWidgets.QLabel("Stop"), 1, 0)
+        wg.addWidget(self.win_hi, 1, 1)
+        v.addWidget(win_box)
+
+        ttl_box = QtWidgets.QGroupBox("TTL gating")
+        tg = QtWidgets.QGridLayout(ttl_box)
+        self.thresh_spin = self._spin(-100.0, 100.0, 3, " V", 1.0)
+        self.minw_spin = self._spin(0.0, 10000.0, 4, " ms", 0.0)
+        tg.addWidget(QtWidgets.QLabel("Threshold"), 0, 0)
+        tg.addWidget(self.thresh_spin, 0, 1)
+        tg.addWidget(QtWidgets.QLabel("Min width"), 1, 0)
+        tg.addWidget(self.minw_spin, 1, 1)
+        v.addWidget(ttl_box)
+
+        scale_box = QtWidgets.QGroupBox("Scan scaling (time → kHz)")
+        sg = QtWidgets.QGridLayout(scale_box)
+        self.range_spin = self._spin(0.0, 1e6, 6, " MHz", 1.0)
+        self.scant_spin = self._spin(1e-6, 1e6, 6, " ms", 1.0)
+        sg.addWidget(QtWidgets.QLabel("Scan range"), 0, 0)
+        sg.addWidget(self.range_spin, 0, 1)
+        sg.addWidget(QtWidgets.QLabel("Scan time"), 1, 0)
+        sg.addWidget(self.scant_spin, 1, 1)
+        v.addWidget(scale_box)
+
+        sweep_box = QtWidgets.QGroupBox("Cavity sweep")
+        qg = QtWidgets.QGridLayout(sweep_box)
+        self.start_spin = self._spin(-1e6, 1e6, 6, " MHz", 0.0)
+        self.step_spin = self._spin(-1e6, 1e6, 6, " MHz", 1.0)
+        self.nsteps_spin = QtWidgets.QSpinBox()
+        self.nsteps_spin.setRange(2, 100000)
+        self.nsteps_spin.setValue(11)
+        self.gof_spin = self._spin(0.0, 1.0, 2, "", 0.5, step=0.05)
+        qg.addWidget(QtWidgets.QLabel("Start"), 0, 0)
+        qg.addWidget(self.start_spin, 0, 1)
+        qg.addWidget(QtWidgets.QLabel("Step"), 1, 0)
+        qg.addWidget(self.step_spin, 1, 1)
+        qg.addWidget(QtWidgets.QLabel("Num steps"), 2, 0)
+        qg.addWidget(self.nsteps_spin, 2, 1)
+        qg.addWidget(QtWidgets.QLabel("Min R²"), 3, 0)
+        qg.addWidget(self.gof_spin, 3, 1)
+        v.addWidget(sweep_box)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("Start Analysis")
+        self.start_btn.clicked.connect(self._start_sweep)
+        self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.clicked.connect(self._reset_sweep)
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.reset_btn)
+        v.addLayout(btn_row)
+
+        self.total_lbl = QtWidgets.QLabel("Total time: 0.0 s")
+        v.addWidget(self.total_lbl)
+        self.status_lbl = QtWidgets.QLabel("Idle. Set Triggered acquisition, then Start.")
+        self.status_lbl.setWordWrap(True)
+        v.addWidget(self.status_lbl)
+        self.result_lbl = QtWidgets.QLabel("")
+        self.result_lbl.setWordWrap(True)
+        self.result_lbl.setTextInteractionFlags(pg.QtCore.Qt.TextSelectableByMouse)
+        v.addWidget(self.result_lbl)
+
+        self._inputs = [self.sig_combo, self.ttl_combo, self.win_lo, self.win_hi,
+                        self.thresh_spin, self.minw_spin, self.range_spin,
+                        self.scant_spin, self.start_spin, self.step_spin,
+                        self.nsteps_spin, self.gof_spin]
+        return panel
+
+    # ---- selection / overlay helpers ----
+    def _sig_idx(self):
+        return self.sig_combo.currentIndex()
+
+    def _ttl_idx(self):
+        return self.ttl_combo.currentIndex()
+
+    def _attach_overlays(self):
+        target = self.host._viewbox_for(self._sig_idx())
+        if self._sig_vb is target:
+            return
+        if self._sig_vb is not None:
+            self._sig_vb.removeItem(self.double_curve)
+            self._sig_vb.removeItem(self.single_curve)
+        target.addItem(self.double_curve)
+        target.addItem(self.single_curve)
+        self._sig_vb = target
+
+    def _on_chan_changed(self, *args):
+        self._attach_overlays()
+        if not self._sweeping:
+            cap = self.host.controller.last_capture
+            if cap is not None:
+                self._preview(*cap)
+
+    # ---- activation ----
+    def activate(self):
+        cfg = self.host.controller.config
+        try:
+            ttl_default = CH_NAMES.index(cfg.trigger_channel)
+        except ValueError:
+            ttl_default = 3
+        self.ttl_combo.setCurrentIndex(ttl_default)
+        sig_default = next((i for i in range(4)
+                            if cfg.enabled[i] and i != ttl_default), 0)
+        self.sig_combo.setCurrentIndex(sig_default)
+
+        self._attach_overlays()
+        self.host.show_fft_panel(True)
+        if not self._on_plot:
+            p = self.host.fft_plot
+            bottom, left = p.getAxis("bottom"), p.getAxis("left")
+            self._saved_labels = (bottom.labelText, bottom.labelUnits,
+                                  left.labelText, left.labelUnits)
+            for it in (self._href, self._errbars, self._scatter,
+                       self._fit_line, self._zero_marker):
+                p.addItem(it)
+            p.setLabel("bottom", "Cavity frequency (MHz)")
+            p.setLabel("left", "Asymmetry (kHz)")
+            p.enableAutoRange()
+            self._on_plot = True
+
+        cap = self.host.controller.last_capture
+        if cap is not None:
+            self._preview(*cap)
+        else:
+            for i in range(4):
+                self.host.curves[i].setData([], [])
+
+    def deactivate(self):
+        if self._sweeping:
+            self._sweeping = False
+            self.host.stop_acquisition()
+        if self._sig_vb is not None:
+            self._sig_vb.removeItem(self.double_curve)
+            self._sig_vb.removeItem(self.single_curve)
+            self._sig_vb = None
+        self.double_curve.setData([], [])
+        self.single_curve.setData([], [])
+        if self._on_plot:
+            p = self.host.fft_plot
+            for it in (self._href, self._errbars, self._scatter,
+                       self._fit_line, self._zero_marker):
+                p.removeItem(it)
+            if self._saved_labels is not None:
+                bt, bu, lt, lu = self._saved_labels
+                p.setLabel("bottom", bt, units=bu)
+                p.setLabel("left", lt, units=lu)
+            self._on_plot = False
+        self.host.show_fft_panel(False)
+
+    # ---- frame handling ----
+    def _preview(self, t, channels):
+        """Live (non-sweeping) view: just show the signal + TTL traces."""
+        si, ti = self._sig_idx(), self._ttl_idx()
+        for i in range(4):
+            if i in (si, ti):
+                td, yd = self.host.decimate_display(t, channels[i])
+                self.host.curves[i].setData(td, yd)
+            else:
+                self.host.curves[i].setData([], [])
+        self.double_curve.setData([], [])
+        self.single_curve.setData([], [])
+
+    def _show_traces(self, t, sig, ttl):
+        si, ti = self._sig_i, self._ttl_i
+        for i in range(4):
+            if i == si:
+                td, yd = self.host.decimate_display(t, sig)
+                self.host.curves[i].setData(td, yd)
+            elif i == ti:
+                td, yd = self.host.decimate_display(t, ttl)
+                self.host.curves[i].setData(td, yd)
+            else:
+                self.host.curves[i].setData([], [])
+
+    def _crop(self, t, sig, ttl):
+        lo, hi = self._win_lo, self._win_hi
+        if hi <= lo:
+            return t, sig, ttl
+        m = (t >= lo) & (t <= hi)
+        return t[m], sig[m], ttl[m]
+
+    def on_frame(self, t, channels, metrics):
+        self._update_total()
+        if not self._sweeping:
+            self._preview(t, channels)
+            return
+
+        k = len(self._success)
+        freq_k = self._start_mhz + k * self._step_mhz
+        tw, sw, ttlw = self._crop(t, channels[self._sig_i], channels[self._ttl_i])
+        self._show_traces(tw, sw, ttlw)
+
+        if tw.size < 8:
+            self._note_failure(k, freq_k, f"window too short ({tw.size} samples).")
+            return
+
+        res = fit_window_asymmetry(tw, sw, ttlw, self._scale,
+                                   threshold=self._thresh, min_width=self._minw,
+                                   gof_min=self._gof)
+        if not res["success"]:
+            self._note_failure(k, freq_k, res["message"])
+            return
+
+        self.double_curve.setData(res["t1"], res["y1_fit"])
+        self.single_curve.setData(res["t2"], res["y2_fit"])
+        self._success.append((freq_k, res["asymm_khz"], res["asymm_err_khz"]))
+        self._update_scatter()
+
+        done = len(self._success)
+        if done >= self._n:
+            self._finalize()
+        else:
+            nxt = self._start_mhz + done * self._step_mhz
+            self.status_lbl.setText(
+                f"Step {done}/{self._n} ok: {res['asymm_khz']:+.3f} ± "
+                f"{res['asymm_err_khz']:.3f} kHz (R²={res['gof']:.3f}).\n"
+                f"Set cavity to {nxt:g} MHz and trigger.  "
+                f"({self._fail_count} failed)")
+
+    def _note_failure(self, k, freq_k, reason):
+        self._fail_count += 1
+        self.double_curve.setData([], [])
+        self.single_curve.setData([], [])
+        self.status_lbl.setText(
+            f"⚠ shot failed: {reason}\nStill at step {k+1}/{self._n} "
+            f"(cavity {freq_k:g} MHz) — retrigger.  ({self._fail_count} failed)")
+
+    def _update_scatter(self):
+        arr = np.array(self._success, dtype=float)
+        xs, ys, es = arr[:, 0], arr[:, 1], arr[:, 2]
+        self._scatter.setData(xs, ys)
+        h = np.where(np.isfinite(es), 2.0 * es, 0.0)
+        beam = abs(self._step_mhz) * 0.2 or 0.1
+        self._errbars.setData(x=xs, y=ys, height=h, beam=beam)
+
+    def _update_total(self):
+        if self._t0 is not None:
+            self.total_lbl.setText(f"Total time: {time.monotonic() - self._t0:.1f} s")
+
+    # ---- sweep control ----
+    def _start_sweep(self):
+        if not self.host.controller.connected:
+            self.status_lbl.setText("Not connected — connect to the scope first.")
+            return
+        if self._sweeping:
+            return
+        if self._sig_idx() == self._ttl_idx():
+            self.status_lbl.setText("Signal and TTL channels must differ.")
+            return
+        step = self.step_spin.value()
+        if step == 0:
+            self.status_lbl.setText("Step size must be non-zero.")
+            return
+        scan_time_s = self.scant_spin.value() * 1e-3
+        if scan_time_s <= 0:
+            self.status_lbl.setText("Scan time must be > 0.")
+            return
+
+        # Snapshot parameters for the whole sweep.
+        self._sig_i = self._sig_idx()
+        self._ttl_i = self._ttl_idx()
+        self._win_lo = self.win_lo.value() * 1e-3
+        self._win_hi = self.win_hi.value() * 1e-3
+        self._thresh = self.thresh_spin.value()
+        self._minw = self.minw_spin.value() * 1e-3
+        self._scale = (self.range_spin.value() * 1e6 / scan_time_s) * 1e-3
+        self._start_mhz = self.start_spin.value()
+        self._step_mhz = step
+        self._n = self.nsteps_spin.value()
+        self._gof = self.gof_spin.value()
+
+        self._success = []
+        self._fail_count = 0
+        self._clear_secondary()
+        self.result_lbl.setText("")
+        self.double_curve.setData([], [])
+        self.single_curve.setData([], [])
+
+        # One frame per trigger: drive a continuous run in Triggered mode.
+        self.host.mode_combo.setCurrentText("Triggered")
+        self._t0 = time.monotonic()
+        self._sweeping = True
+        self.status_lbl.setText(
+            f"Step 1/{self._n} — set cavity to {self._start_mhz:g} MHz and trigger.")
+        self._launch_run()
+
+    def _launch_run(self):
+        worker = getattr(self.host, "worker", None)
+        if worker is not None and worker.isRunning():
+            # Stop the stale run, then start once its finished() has flushed so the
+            # queued not-running callback can't gray us out mid-sweep.
+            self.host.stop_acquisition()
+            pg.QtCore.QTimer.singleShot(0, self.host.start_continuous)
+        else:
+            self.host.start_continuous()
+
+    def _reset_sweep(self):
+        self._sweeping = False
+        self.host.stop_acquisition()
+        self._success = []
+        self._fail_count = 0
+        self._t0 = None
+        self._clear_secondary()
+        self.double_curve.setData([], [])
+        self.single_curve.setData([], [])
+        self.total_lbl.setText("Total time: 0.0 s")
+        self.status_lbl.setText("Reset. Set Triggered acquisition, then Start.")
+        self.result_lbl.setText("")
+        # If no worker was running, stop_acquisition won't re-enable controls.
+        worker = getattr(self.host, "worker", None)
+        self.set_running_state(worker is not None and worker.isRunning(), True)
+
+    def _clear_secondary(self):
+        self._scatter.setData([], [])
+        self._errbars.setData(x=np.array([]), y=np.array([]),
+                              height=np.array([]), beam=0.0)
+        self._fit_line.setData([], [])
+        self._zero_marker.setVisible(False)
+
+    def _finalize(self):
+        self._sweeping = False
+        self.host.stop_acquisition()
+        self._update_total()
+
+        arr = np.array(self._success, dtype=float)
+        n = arr.shape[0]
+        if n < 2:
+            self.status_lbl.setText(
+                f"Sweep stopped: need ≥2 valid points (got {n}, "
+                f"{self._fail_count} failed).")
+            return
+        xs, ys, es = arr[:, 0], arr[:, 1], arr[:, 2]
+
+        # Weight by 1/sigma where the fit gave a usable error; fall back to the
+        # median error for points whose covariance was singular.
+        good = np.isfinite(es) & (es > 0)
+        w = 1.0 / np.where(good, es, np.median(es[good])) if good.any() else None
+
+        cov = None
+        try:
+            coeffs, cov = np.polyfit(xs, ys, 1, w=w, cov=True)
+        except (ValueError, np.linalg.LinAlgError):
+            coeffs = np.polyfit(xs, ys, 1, w=w)
+        m, c = float(coeffs[0]), float(coeffs[1])
+        if m == 0:
+            self.status_lbl.setText("Sweep complete, but slope ≈ 0 — no zero crossing.")
+            return
+
+        zero = -c / m
+        if cov is not None and np.all(np.isfinite(cov)):
+            var = (cov[1, 1] / m**2 + (c**2 / m**4) * cov[0, 0]
+                   - 2.0 * (c / m**3) * cov[0, 1])
+            dz = float(np.sqrt(var)) if var > 0 else float("nan")
+        else:
+            dz = float("nan")
+
+        xspan = float(xs.max() - xs.min()) or 1.0
+        xf = np.linspace(xs.min() - 0.05 * xspan, xs.max() + 0.05 * xspan, 200)
+        self._fit_line.setData(xf, m * xf + c)
+        self._zero_marker.setValue(zero)
+        self._zero_marker.setVisible(True)
+
+        self.status_lbl.setText(
+            f"Sweep complete: {n} valid, {self._fail_count} failed.")
+        self.result_lbl.setText(
+            f"Optimal cavity frequency (asymmetry = 0):\n"
+            f"   {zero:.4f} ± {dz:.4f} MHz\n"
+            f"slope = {m:.4g} kHz/MHz,  intercept = {c:.4g} kHz")
+
+    def set_running_state(self, running, continuous):
+        self.start_btn.setEnabled(self.host.controller.connected and not running)
+        for w in getattr(self, "_inputs", []):
+            w.setEnabled(not running)
