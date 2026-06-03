@@ -34,6 +34,11 @@ and demo without a scope attached.
     a single bare-cavity peak). Plots the doublet-vs-single asymmetry (kHz) vs.
     cavity frequency, line-fits it, and reports the zero-crossing — the cavity
     frequency where the atomic line is aligned.
+- **Heterodyne viewer** (`run_heterodyne.py`) — a separate, bare-bones app for
+  heterodyne processing: it always reads all four channels (A heterodyne, B/C RF
+  tones, D TTL gate), IQ-demodulates A against the `B·C` reference at the two beat
+  frequencies `f_B ± f_C`, and plots the recovered magnitude `4(I²+Q²)` and phase.
+  See its own section below.
 - **Notebook-friendly analysis** — `analysis.py` is pure numpy/scipy (no Qt), so
   the same math the GUI uses imports directly into a notebook.
 - **Simulation mode** — `--simulate` synthesizes a heterodyne-flavored test
@@ -49,6 +54,7 @@ and demo without a scope attached.
 
 ```
 run_scope.py                     Launcher (sets sys.path + cwd, then opens the GUI)
+run_heterodyne.py                Launcher for the heterodyne viewer (sys.path + cwd)
 requirements.txt                 numpy, scipy, pyqtgraph, PySide6
 CLAUDE.md                        Project context + working conventions (for AI assistants)
 CleverscopeTesting.ipynb         Scratch/exploration notebook
@@ -58,11 +64,13 @@ Cscope control driver/
   controller.py                  ScopeConfig + ScopeController (+ MockScope): a
                                  reusable, GUI-free control layer
   analysis.py                    Pure numpy/scipy analysis (fit_lorentzian,
-                                 compute_spectrum, fit_window_asymmetry) — no Qt,
+                                 compute_spectrum, fit_window_asymmetry, envelope,
+                                 dominant_frequency, demodulate_beatnote) — no Qt,
                                  notebook-importable
   analysis_modes.py              Mode framework: AnalysisMode base + FreeViewMode,
                                  LorentzianFitMode, FFTMode, VRSAlignmentMode
   gui.py                         The PyQtGraph readout app (ScopeWindow)
+  heterodyne_viewer.py           Standalone heterodyne signal + IQ-demod viewer
   CleverscopeInterface.py, T_*.py, Cleverscope*.py
                                  Vendor driver + examples (flat imports)
 docs/commit-log/                 One file per commit documenting what/why (see index.md)
@@ -86,11 +94,15 @@ docs/commit-log/                 One file per commit documenting what/why (see i
 ```bash
 python run_scope.py             # real hardware (needs the DLL + scope)
 python run_scope.py --simulate  # synthetic data, no hardware
+
+python run_heterodyne.py            # heterodyne viewer, real hardware
+python run_heterodyne.py --simulate # heterodyne viewer, synthetic two-tone data
 ```
 
 `run_scope.py` handles the two environment quirks the vendor driver needs: it puts
 `Cscope control driver/` on `sys.path` (the vendor modules use flat imports) and
 sets the working directory to the repo root (so the DLL's relative path resolves).
+`run_heterodyne.py` does the same for the heterodyne viewer (see its section below).
 
 ---
 
@@ -194,6 +206,59 @@ Each waveform trace is drawn at ≤ 5000 points (stride decimation) for fast fra
 updates. This affects the **display only** — the stored capture stays
 full-resolution, and analysis (fits, FFT) and *Save full* use the complete data.
 The cap does not apply to the FFT spectrum.
+
+---
+
+## Heterodyne viewer
+
+`run_heterodyne.py` opens a separate, deliberately bare-bones app focused on
+heterodyne processing — distinct from the main readout above. It always reads all
+four channels with fixed roles:
+
+- **A** — heterodyne beat signal (carries two tones at `f_B ± f_C`)
+- **B**, **C** — RF tones; their product `B·C` is the demodulation reference
+- **D** — TTL gate
+
+```bash
+python run_heterodyne.py            # real hardware (needs the DLL + scope)
+python run_heterodyne.py --simulate # synthetic two-tone data, no hardware
+```
+
+**Controls (left panel):**
+
+- **Connection** — serial + Connect/Disconnect.
+- **Measurement** — a measurement *duration*; the capture window is that duration
+  padded by ±100 µs of guard, so the TTL edges sit just inside the window.
+- **Sampling** — sampling rate (400 MHz … 1 MHz; default 50 MHz).
+- **Scale (±)** — per-channel vertical scale chosen as a ± magnitude
+  (10 mV … 5 V) rather than a min/max pair.
+- **Demod** — bandpass bandwidth and I/Q lowpass cutoff (kHz), plus a readout of
+  the detected `f_B`, `f_C` and the two beat centers.
+- **Run / Single / Stop.**
+
+**Plots:**
+
+- **Left column** — the four raw channels, stacked. A/B/C share one time axis;
+  **channel D is a fixed full-window navigator** with a draggable region that sets
+  the time view of every other plot (drag/resize it to zoom A/B/C *and* the demod
+  plots together). D also shows a light-gray band = the amplitude envelope
+  ("magnitude") of the *total* channel A, as a navigation aid.
+- **Right column** — the demodulation results, X-linked to the channel view:
+  - **Magnitude** `4(I² + Q²)` for both beat tones (`f_B − f_C`, `f_B + f_C`).
+  - **Phase** `atan2(Q, I)` for both tones.
+
+**Demodulation** (the math is in `analysis.py`, notebook-importable): detect
+`f_B`/`f_C` as the dominant FFT components of B and C; form `ref = B·C`; for each
+center `f_B ∓ f_C`, bandpass A and ref, take the analytic signal of the
+amplitude-normalized ref as the quadrature reference, mix to get raw I/Q, lowpass,
+then report `4(I²+Q²)` and `atan2(Q,I)`. Acquisition runs on a worker thread that
+**drops frames while the GUI is still analyzing**, so the heavy per-frame demod
+can't back up the queue or time the scope out in continuous mode.
+
+**Simulation** (`--simulate`): A = two tones at `f_B − f_C` (3.5 MHz) and
+`f_B + f_C` (4.5 MHz), each with its own Lorentzian amplitude envelope offset by
+~1 HWHM; B = 4 MHz, C = 0.5 MHz; D = a 3 ms TTL pulse. Demodulating then recovers
+the two misaligned Lorentzians as the magnitude traces.
 
 ---
 

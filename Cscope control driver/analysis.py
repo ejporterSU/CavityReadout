@@ -12,7 +12,93 @@ way the GUI uses them, e.g.
 
 import numpy as np
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, hilbert, butter, sosfiltfilt, filtfilt
+
+
+def dominant_frequency(y, fs, fmin=0.0, fmax=None):
+    """Frequency (Hz) of the largest rFFT-magnitude component of ``y``, ignoring
+    DC. Optionally restrict the search to ``[fmin, fmax]``. Used to detect the RF
+    tones on channels B and C. Returns 0.0 if ``y`` is too short or empty.
+    """
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if n < 4:
+        return 0.0
+    mag = np.abs(np.fft.rfft(y - y.mean()))
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    mask = freqs > 0
+    if fmin:
+        mask &= freqs >= fmin
+    if fmax is not None:
+        mask &= freqs <= fmax
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        return 0.0
+    return float(freqs[idx[np.argmax(mag[idx])]])
+
+
+def demodulate_beatnote(het, ref, f_center, fs, f_bw=500e3, f_lp=100e3,
+                        digital_mix=False):
+    """IQ-demodulate heterodyne signal ``het`` at ``f_center`` against reference
+    ``ref``, returning ``(magnitude, phase, I, Q)`` where
+    ``magnitude = 4*(I**2 + Q**2)`` and ``phase = arctan2(Q, I)``.
+
+    Bandpasses ``het`` (and ``ref``) around ``f_center`` (width ``f_bw``), forms
+    the reference quadratures from the analytic signal of the normalized
+    bandpassed ``ref``, mixes, then lowpasses I/Q at ``f_lp``. With
+    ``digital_mix=True`` it mixes against an ideal ``cos``/``sin`` at
+    ``f_center`` instead of ``ref`` (no reference channel needed).
+
+    Ported from the ``CleverscopeTesting`` notebook. Returns zero arrays if the
+    band is unusable for the given sampling rate (``f_center<=0`` or
+    ``f_center + f_bw/2 >= Nyquist``), so a too-low sample rate fails gracefully.
+    """
+    het = np.asarray(het, dtype=float)
+    n = het.size
+    nyq = 0.5 * fs
+    zeros = np.zeros(n)
+    low = max(1.0, f_center - f_bw / 2.0)
+    high = min(0.999 * nyq, f_center + f_bw / 2.0)
+    if f_center <= 0 or low >= high or n < 4:
+        return zeros, zeros, zeros, zeros
+
+    sos_bp = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
+    het_bp = sosfiltfilt(sos_bp, het)
+
+    if digital_mix:
+        t = np.arange(n) / fs
+        raw_i = het_bp * np.cos(2 * np.pi * f_center * t)
+        raw_q = het_bp * np.sin(2 * np.pi * f_center * t)
+    else:
+        ref_bp = sosfiltfilt(sos_bp, np.asarray(ref, dtype=float))
+        # normalize by the central-window amplitude (avoids filtfilt edge transients)
+        norm = np.max(np.abs(ref_bp[int(n * 0.25):int(n * 0.75)])) or 1.0
+        ref_analytic = hilbert(ref_bp / norm)
+        raw_i = het_bp * np.real(ref_analytic)
+        raw_q = het_bp * np.imag(ref_analytic)
+
+    b_lp, a_lp = butter(4, f_lp / nyq, btype="low")
+    i_demod = filtfilt(b_lp, a_lp, raw_i)
+    q_demod = filtfilt(b_lp, a_lp, raw_q)
+
+    magnitude = 4.0 * (i_demod**2 + q_demod**2)
+    phase = np.arctan2(q_demod, i_demod)
+    return magnitude, phase, i_demod, q_demod
+
+
+def envelope(y):
+    """Amplitude envelope of a (band-limited) signal via the analytic signal.
+
+    Returns ``|hilbert(y - mean(y))|`` — the instantaneous amplitude of ``y``
+    about its mean, e.g. the slowly-varying amplitude of a heterodyne carrier,
+    so a Lorentzian/cavity amplitude profile is visible without the carrier
+    oscillation. ``y`` must be sampled above the carrier's Nyquist rate or the
+    envelope is aliased.
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size == 0:
+        return y
+    return np.abs(hilbert(y - np.mean(y)))
 
 
 def lorentzian(t, t0, fwhm, amp, offset):
