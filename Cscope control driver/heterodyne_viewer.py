@@ -41,6 +41,7 @@ from analysis import envelope, dominant_frequency, demodulate_beatnote
 # Colors / labels for the two demodulated tones (lower / upper sideband).
 DEMOD_COLORS = ["#9467bd", "#17becf"]            # purple, teal
 DEMOD_LABELS = ["f_B − f_C", "f_B + f_C"]
+PHASE_SUM_COLOR = "#444444"                       # sum-of-phases trace (dark gray)
 
 
 # Per-channel role, parallel to CH_NAMES = ["A", "B", "C", "D"].
@@ -82,7 +83,7 @@ def default_config():
         trigger_channel="D",
         trigger_level_v=1.0,
         trigger_slope="Rising",
-        acq_mode="Auto",
+        acq_mode="Single",   # the viewer never auto-triggers (Run re-arms singles)
     )
 
 
@@ -210,10 +211,11 @@ class DemodAcquisitionWorker(QtCore.QThread):
     frameReady = QtCore.Signal(object)   # (t, channels, metrics)
     failed = QtCore.Signal(str)
 
-    def __init__(self, controller, continuous, parent=None):
+    def __init__(self, controller, continuous, mode=None, parent=None):
         super().__init__(parent)
         self._controller = controller
         self._continuous = continuous
+        self._mode = mode          # acquisition mode for acquire_once (None -> config)
         self._running = True
         self._processed = threading.Event()
         self._processed.set()
@@ -230,15 +232,18 @@ class DemodAcquisitionWorker(QtCore.QThread):
         while self._running:
             if self._controller.needs_apply():
                 self._controller.apply_config()
-            t, channels, metrics = self._controller.acquire_once()
+            t, channels, metrics = self._controller.acquire_once(self._mode)
             if not self._running:
                 return
             if t is None:
+                if self._continuous:
+                    # No trigger within the acquire timeout — not a failure in a
+                    # re-arming run; report waiting and arm the next single-shot.
+                    self.failed.emit("Waiting for trigger…")
+                    self.msleep(20)
+                    continue
                 self.failed.emit("Acquisition failed or timed out.")
-                if not self._continuous:
-                    return
-                self.msleep(20)
-                continue
+                return
             if not self._continuous:
                 self.frameReady.emit((t, channels, metrics))
                 return
@@ -437,20 +442,37 @@ class HeterodyneViewer(QtWidgets.QMainWindow):
             it.setZValue(-10)   # keep the band behind the TTL trace
         return glw
 
-    def _build_demod_plots(self):
-        """Right column: demodulated magnitude (top) and phase (bottom), each
-        overlaying both tones. X-linked to channel A so they follow the navigator
-        zoom exactly like the raw channels."""
-        glw = pg.GraphicsLayoutWidget()
-        glw.setBackground("w")
+    @staticmethod
+    def _make_toggle(text, color, checked, on_toggle):
+        """A compact checkable button colored by its trace; filled when on."""
+        btn = QtWidgets.QPushButton(text)
+        btn.setCheckable(True)
+        btn.setChecked(checked)
+        btn.setStyleSheet(
+            f"QPushButton {{ color: {color}; border: 1px solid {color}; "
+            f"border-radius: 3px; padding: 1px 6px; }} "
+            f"QPushButton:checked {{ background: {color}; color: white; }}")
+        btn.toggled.connect(on_toggle)
+        return btn
 
-        self.mag_plot = glw.addPlot(row=0, col=0)
+    def _build_demod_plots(self):
+        """Right column: demodulated magnitude (top) and phase (bottom), each in
+        its own pane with show/hide toggles. Both overlay the two tones; the phase
+        pane also has the sum of the two phases (off by default). Both plots are
+        X-linked to channel A so they follow the navigator zoom."""
+        pane = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(pane)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        self.mag_plot = pg.PlotWidget()
+        self.mag_plot.setBackground("w")
         self.mag_plot.showGrid(x=True, y=True, alpha=0.3)
         self.mag_plot.setLabel("left", "4 (I² + Q²)", units="V²")
         self.mag_plot.getAxis("bottom").setStyle(showValues=False)
-        self.mag_plot.addLegend(offset=(-10, 10))
 
-        self.phase_plot = glw.addPlot(row=1, col=0)
+        self.phase_plot = pg.PlotWidget()
+        self.phase_plot.setBackground("w")
         self.phase_plot.showGrid(x=True, y=True, alpha=0.3)
         self.phase_plot.setLabel("left", "Phase atan2(Q, I)", units="rad")
         self.phase_plot.setLabel("bottom", "Time", units="s")
@@ -464,14 +486,54 @@ class HeterodyneViewer(QtWidgets.QMainWindow):
         self.phase_curves = []
         for k in range(2):
             pen = pg.mkPen(DEMOD_COLORS[k], width=1)
-            mc = self.mag_plot.plot(pen=pen, name=DEMOD_LABELS[k])
-            pc = self.phase_plot.plot(pen=pen, name=DEMOD_LABELS[k])
+            mc = self.mag_plot.plot(pen=pen)
+            pc = self.phase_plot.plot(pen=pen)
             for c in (mc, pc):
                 c.setDownsampling(auto=True)
                 c.setClipToView(True)
             self.mag_curves.append(mc)
             self.phase_curves.append(pc)
-        return glw
+        # sum-of-phases trace, hidden until its toggle is enabled
+        self.phase_sum_curve = self.phase_plot.plot(
+            pen=pg.mkPen(PHASE_SUM_COLOR, width=1))
+        self.phase_sum_curve.setDownsampling(auto=True)
+        self.phase_sum_curve.setClipToView(True)
+        self.phase_sum_curve.setVisible(False)
+
+        # magnitude toggles: the two tones
+        mag_row = QtWidgets.QHBoxLayout()
+        mag_row.setContentsMargins(6, 2, 6, 0)
+        mag_row.addWidget(QtWidgets.QLabel("Magnitude:"))
+        for k in range(2):
+            mag_row.addWidget(self._make_toggle(
+                DEMOD_LABELS[k], DEMOD_COLORS[k], True,
+                lambda on, c=self.mag_curves[k]: c.setVisible(on)))
+        mag_row.addStretch(1)
+
+        # phase toggles: the two tones plus their sum
+        phase_row = QtWidgets.QHBoxLayout()
+        phase_row.setContentsMargins(6, 2, 6, 0)
+        phase_row.addWidget(QtWidgets.QLabel("Phase:"))
+        for k in range(2):
+            phase_row.addWidget(self._make_toggle(
+                DEMOD_LABELS[k], DEMOD_COLORS[k], True,
+                lambda on, c=self.phase_curves[k]: c.setVisible(on)))
+        phase_row.addWidget(self._make_toggle(
+            "Sum", PHASE_SUM_COLOR, False, self._on_phase_sum_toggled))
+        phase_row.addStretch(1)
+
+        lay.addLayout(mag_row)
+        lay.addWidget(self.mag_plot, 1)
+        lay.addLayout(phase_row)
+        lay.addWidget(self.phase_plot, 1)
+        return pane
+
+    def _on_phase_sum_toggled(self, on):
+        """Show/hide the summed-phase trace; widen the phase y-range to ±2π while
+        it's shown (the sum spans twice the single-phase range)."""
+        self.phase_sum_curve.setVisible(on)
+        hi = 2 * np.pi if on else np.pi
+        self.phase_plot.setYRange(-hi, hi, padding=0.05)
 
     # ---------- config <-> widgets ----------
     def _sync_controls_to_config(self):
@@ -569,16 +631,20 @@ class HeterodyneViewer(QtWidgets.QMainWindow):
             for k in range(2):
                 self.mag_curves[k].setData([], [])
                 self.phase_curves[k].setData([], [])
+            self.phase_sum_curve.setData([], [])
             return
         ref = b * c
         f_bw = self.bw_spin.value() * 1e3
         f_lp = self.lp_spin.value() * 1e3
+        phases = []
         for k, fcen in enumerate(centers):
             mag, phase, _, _ = demodulate_beatnote(a, ref, fcen, fs,
                                                    f_bw=f_bw, f_lp=f_lp,
                                                    digital_mix=False)
             self.mag_curves[k].setData(t, mag)
             self.phase_curves[k].setData(t, phase)
+            phases.append(phase)
+        self.phase_sum_curve.setData(t, phases[0] + phases[1])
 
     def _redraw_demod(self, *args):
         """Recompute demod from the last capture (e.g. after a filter-param edit)."""
@@ -645,7 +711,12 @@ class HeterodyneViewer(QtWidgets.QMainWindow):
             return
         self._read_config_from_controls()
         self._continuous = continuous
-        self.worker = DemodAcquisitionWorker(self.controller, continuous=continuous)
+        # The viewer never auto-triggers. Both Run and Single wait for a real
+        # trigger (single-shot); Run just re-arms another single-shot after each
+        # frame finishes analyzing (the gate in the worker), so shots arrive one
+        # at a time as they trigger.
+        self.worker = DemodAcquisitionWorker(self.controller, continuous=continuous,
+                                             mode="Single")
         self.worker.frameReady.connect(self._on_frame)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self._on_worker_done)

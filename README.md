@@ -234,7 +234,10 @@ python run_heterodyne.py --simulate # synthetic two-tone data, no hardware
   (10 mV … 5 V) rather than a min/max pair.
 - **Demod** — bandpass bandwidth and I/Q lowpass cutoff (kHz), plus a readout of
   the detected `f_B`, `f_C` and the two beat centers.
-- **Run / Single / Stop.**
+- **Run / Single / Stop** — the viewer **never auto-triggers**. *Single* arms one
+  single-shot capture and waits for a trigger; *Run* re-arms a fresh single-shot
+  after each frame finishes analyzing, so triggered shots come in one at a time
+  (triggers during analysis are dropped). "Waiting for trigger…" shows during gaps.
 
 **Plots:**
 
@@ -243,9 +246,11 @@ python run_heterodyne.py --simulate # synthetic two-tone data, no hardware
   the time view of every other plot (drag/resize it to zoom A/B/C *and* the demod
   plots together). D also shows a light-gray band = the amplitude envelope
   ("magnitude") of the *total* channel A, as a navigation aid.
-- **Right column** — the demodulation results, X-linked to the channel view:
-  - **Magnitude** `4(I² + Q²)` for both beat tones (`f_B − f_C`, `f_B + f_C`).
-  - **Phase** `atan2(Q, I)` for both tones.
+- **Right column** — the demodulation results, X-linked to the channel view, each
+  pane with show/hide toggle buttons:
+  - **Magnitude** `4(I² + Q²)` — a toggle per beat tone (`f_B − f_C`, `f_B + f_C`).
+  - **Phase** `atan2(Q, I)` — three toggles: each tone plus their **Sum** (off by
+    default; enabling it widens the phase axis to ±2π).
 
 **Demodulation** (the math is in `analysis.py`, notebook-importable): detect
 `f_B`/`f_C` as the dominant FFT components of B and C; form `ref = B·C`; for each
